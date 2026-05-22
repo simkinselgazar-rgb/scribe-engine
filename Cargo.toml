@@ -7,7 +7,35 @@ license = "Apache-2.0"
 description = "On-device audio capture, transcription, and transcript-to-notes pipeline — the open-source core of On-Device Scribe."
 repository = "https://github.com/simkinselgazar-rgb/scribe-engine"
 
+# whisper.cpp and llama.cpp each statically bundle their own copy of
+# `ggml`; linked into one binary, the duplicate symbols collide and
+# corrupt inference. So the notes LLM lives in its own crate, built as a
+# standalone sidecar binary — see `notes-llm/`. This crate (and anything
+# that links it, like the desktop app) carries only whisper.cpp's ggml.
+[workspace]
+members = ["notes-llm"]
+
 [lib]
 
 [dependencies]
 thiserror = "2"
+
+# Transcription backend — whisper.cpp via whisper-rs. Built from source
+# (cmake); runs entirely on-device, no network. The model file is
+# supplied by the host app — this crate never fetches it.
+whisper-rs = "0.14"
+
+# WAV decoding for recordings, and WAV encoding for the recorder.
+hound = "3"
+
+# Audio capture. Microphone (the near end) via cpal — cross-platform,
+# which also seeds the later Windows tier. System audio (the far end)
+# via Apple's ScreenCaptureKit. Both run entirely on-device.
+cpal = "0.17"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+screencapturekit = "6"
+
+# The transcript ⇄ notes-sidecar wire format, and parsing its output.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -1,0 +1,20 @@
+[package]
+name = "scribe-notes-llm"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "On-device notes-generation sidecar for scribe-engine — a standalone llama.cpp process, kept out of the whisper.cpp binary to avoid a ggml symbol collision."
+
+[[bin]]
+name = "scribe-notes-llm"
+path = "src/main.rs"
+
+[dependencies]
+# Notes backend — a local LLM via llama.cpp. Built from source (cmake).
+# This crate deliberately does NOT depend on whisper-rs / scribe-engine:
+# keeping llama.cpp's ggml in its own binary is the whole point.
+llama-cpp-2 = "0.1"
+
+# The transcript ⇄ notes wire protocol on stdin/stdout.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -1,0 +1,12 @@
+# screencapturekit pulls in Swift bridge crates (apple-metal, apple-cf).
+# With only the Command Line Tools installed (no full Xcode):
+#   -L  ...  lets the linker find the static Swift compatibility archives
+#            (they ship under CommandLineTools, not the Xcode path it
+#            otherwise looks in);
+#   -rpath ... lets the finished binary find the dynamic Swift runtime,
+#            which lives in the OS at /usr/lib/swift on macOS 12+.
+[target.'cfg(target_os = "macos")']
+rustflags = [
+  "-L", "native=/Library/Developer/CommandLineTools/usr/lib/swift/macosx",
+  "-C", "link-arg=-Wl,-rpath,/usr/lib/swift",
+]

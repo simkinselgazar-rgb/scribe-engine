@@ -20,12 +20,16 @@
 //!
 //! The host application (the Tauri desktop app) composes the three.
 
+pub mod audio;
 pub mod capture;
 pub mod model;
 pub mod notes;
 pub mod transcribe;
 
+pub use capture::{AudioCapture, CaptureLevels, Recorder};
 pub use model::{BillableDraft, Notes, NoteItem, Speaker, Transcript, TranscriptSegment};
+pub use notes::{NotesGenerator, SidecarNotesGenerator};
+pub use transcribe::{Transcriber, WhisperTranscriber};
 
 /// Errors surfaced by the engine. Every variant is local — there is no
 /// network failure mode, because the engine never touches a network.
