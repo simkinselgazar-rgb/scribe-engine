@@ -1,0 +1,13 @@
+[package]
+name = "scribe-engine"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+license = "Apache-2.0"
+description = "On-device audio capture, transcription, and transcript-to-notes pipeline — the open-source core of On-Device Scribe."
+repository = "https://github.com/simkinselgazar-rgb/scribe-engine"
+
+[lib]
+
+[dependencies]
+thiserror = "2"
