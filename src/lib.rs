@@ -27,7 +27,9 @@ pub mod notes;
 pub mod transcribe;
 
 pub use capture::{AudioCapture, CaptureLevels, Recorder};
-pub use model::{BillableDraft, Notes, NoteItem, Speaker, Transcript, TranscriptSegment};
+pub use model::{
+    BillableDraft, Notes, NoteItem, RecordingScenario, Speaker, Transcript, TranscriptSegment,
+};
 pub use notes::{NotesGenerator, SidecarNotesGenerator};
 pub use transcribe::{Transcriber, WhisperTranscriber};
 

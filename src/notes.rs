@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{BillableDraft, NoteItem, Notes, Speaker};
+use crate::model::{BillableDraft, NoteItem, Notes, RecordingScenario, Speaker};
 use crate::{EngineError, Result, Transcript};
 
 /// A note-generation backend.
@@ -29,7 +29,14 @@ pub trait NotesGenerator: Send {
     ///
     /// `context` is an optional operator-supplied note about the meeting
     /// (parties, matter, what to focus on) — it grounds the summary.
-    fn generate(&self, transcript: &Transcript, context: Option<&str>) -> Result<Notes>;
+    /// `scenario` tells the model how to read the transcript: one
+    /// speaker, two sides, or an unseparated room.
+    fn generate(
+        &self,
+        transcript: &Transcript,
+        context: Option<&str>,
+        scenario: RecordingScenario,
+    ) -> Result<Notes>;
 }
 
 /// Runs note generation in the `scribe-notes-llm` sidecar process.
@@ -52,12 +59,17 @@ impl SidecarNotesGenerator {
 }
 
 impl NotesGenerator for SidecarNotesGenerator {
-    fn generate(&self, transcript: &Transcript, context: Option<&str>) -> Result<Notes> {
+    fn generate(
+        &self,
+        transcript: &Transcript,
+        context: Option<&str>,
+        scenario: RecordingScenario,
+    ) -> Result<Notes> {
         if transcript.segments.is_empty() {
             return Err(EngineError::Notes("transcript is empty".into()));
         }
 
-        let request = serde_json::to_vec(&WireTranscript::new(transcript, context))
+        let request = serde_json::to_vec(&WireTranscript::new(transcript, context, scenario))
             .map_err(|e| EngineError::Notes(format!("could not encode transcript: {e}")))?;
 
         let mut child = Command::new(&self.sidecar)
@@ -106,6 +118,8 @@ impl NotesGenerator for SidecarNotesGenerator {
 
 #[derive(Serialize)]
 struct WireTranscript {
+    /// The recording scenario, as a snake_case tag the sidecar reads.
+    scenario: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     context: Option<String>,
     segments: Vec<WireSegment>,
@@ -120,7 +134,11 @@ struct WireSegment {
 }
 
 impl WireTranscript {
-    fn new(transcript: &Transcript, context: Option<&str>) -> Self {
+    fn new(
+        transcript: &Transcript,
+        context: Option<&str>,
+        scenario: RecordingScenario,
+    ) -> Self {
         let segments = transcript
             .segments
             .iter()
@@ -135,6 +153,11 @@ impl WireTranscript {
             })
             .collect();
         Self {
+            scenario: match scenario {
+                RecordingScenario::SoloMemo => "solo_memo",
+                RecordingScenario::VirtualMeeting => "virtual_meeting",
+                RecordingScenario::InPersonMeeting => "in_person_meeting",
+            },
             context: context
                 .map(str::trim)
                 .filter(|c| !c.is_empty())

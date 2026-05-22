@@ -84,13 +84,14 @@ fn run() -> Result<(), String> {
 
     let session = LlamaSession::load(Path::new(&model_path))?;
     let context = clamped_context(&transcript.context);
+    let scenario = transcript.scenario;
 
     // Short meeting: one pass. Long meeting: chunk and combine.
-    let notes = if format_segments(&transcript.segments).len() <= SINGLE_PASS_CHARS {
-        let prompt = build_notes_prompt(&transcript.segments, &context, None);
+    let notes = if format_segments(&transcript.segments, scenario).len() <= SINGLE_PASS_CHARS {
+        let prompt = build_notes_prompt(&transcript.segments, &context, scenario, None);
         run_and_parse(&session, &prompt, &transcript.segments)?
     } else {
-        generate_chunked(&session, &transcript.segments, &context)?
+        generate_chunked(&session, &transcript.segments, &context, scenario)?
     };
 
     let json =
@@ -131,6 +132,7 @@ fn generate_chunked(
     session: &LlamaSession,
     segments: &[WireSegment],
     context: &str,
+    scenario: Scenario,
 ) -> Result<WireNotes, String> {
     let ranges = chunk_ranges(segments);
     let total = ranges.len();
@@ -138,7 +140,7 @@ fn generate_chunked(
     let mut parts: Vec<WireNotes> = Vec::with_capacity(total);
     for (i, range) in ranges.iter().enumerate() {
         let chunk = &segments[range.clone()];
-        let prompt = build_notes_prompt(chunk, context, Some((i + 1, total)));
+        let prompt = build_notes_prompt(chunk, context, scenario, Some((i + 1, total)));
         // One unparseable chunk (after retries) should not lose the
         // whole meeting — skip it and let the rest carry the notes.
         match run_and_parse(session, &prompt, chunk) {
@@ -311,17 +313,23 @@ fn rendered_len(segment: &WireSegment) -> usize {
     segment.text.trim().len() + 16
 }
 
-/// Render segments as `[<seconds>s] Speaker: text` lines.
-fn format_segments(segments: &[WireSegment]) -> String {
+/// Render segments as transcript lines. A [`Scenario::VirtualMeeting`]
+/// has two channels, so its lines carry a `Me:` / `Other:` speaker
+/// label; the single-microphone scenarios have no reliable per-speaker
+/// channel, so their lines carry only a timecode.
+fn format_segments(segments: &[WireSegment], scenario: Scenario) -> String {
     let mut out = String::new();
     for segment in segments {
-        let speaker = if segment.speaker == "near" { "Me" } else { "Other" };
-        out.push_str(&format!(
-            "[{}s] {}: {}\n",
-            segment.start_secs,
-            speaker,
-            segment.text.trim()
-        ));
+        let text = segment.text.trim();
+        match scenario {
+            Scenario::VirtualMeeting => {
+                let speaker = if segment.speaker == "near" { "Me" } else { "Other" };
+                out.push_str(&format!("[{}s] {speaker}: {text}\n", segment.start_secs));
+            }
+            Scenario::SoloMemo | Scenario::InPersonMeeting => {
+                out.push_str(&format!("[{}s] {text}\n", segment.start_secs));
+            }
+        }
     }
     out
 }
@@ -335,11 +343,33 @@ fn gemma_turn(system: &str, user: &str) -> String {
     )
 }
 
+/// How the notes model should read the transcript — one sentence of
+/// framing, chosen by the recording scenario.
+fn scenario_framing(scenario: Scenario) -> &'static str {
+    match scenario {
+        Scenario::VirtualMeeting => {
+            "This is a transcript of a virtual meeting. \"Me\" is the professional; \
+\"Other\" is the client or counterparty."
+        }
+        Scenario::SoloMemo => {
+            "This is a solo voice memo. The professional is speaking alone, with no one \
+else present. Treat every line as the professional's own dictation: their notes, \
+decisions, and reminders to themselves."
+        }
+        Scenario::InPersonMeeting => {
+            "This transcript was recorded on a single microphone, in a room or on a phone \
+call on speaker. More than one person is speaking and the transcript does not identify who \
+said what, so do not attribute any statement to a specific person."
+        }
+    }
+}
+
 /// Build the notes prompt for a whole short transcript (`part` is
 /// `None`) or one chunk of a long one (`part` is `Some((n, total))`).
 fn build_notes_prompt(
     segments: &[WireSegment],
     context: &str,
+    scenario: Scenario,
     part: Option<(usize, usize)>,
 ) -> String {
     let system = "You are a meeting-notes assistant for a busy professional. \
@@ -347,10 +377,11 @@ You read a timecoded transcript and return concise, accurate notes. \
 Reply with ONLY a single JSON object and nothing else. No prose, no markdown fences.";
 
     let schema = NOTES_SCHEMA;
+    let framing = scenario_framing(scenario);
 
     let scope = match part {
         Some((n, total)) => format!(
-            "This is part {n} of {total} of one longer meeting; the parts are in order. \
+            "This is part {n} of {total} of one longer recording; the parts are in order. \
 Write notes covering only this part. Its first lines may repeat the end of the previous \
 part for continuity. "
         ),
@@ -359,16 +390,15 @@ part for continuity. "
     let background = if context.is_empty() {
         String::new()
     } else {
-        format!("Background the operator gave for this meeting: {context}\n\n")
+        format!("Background the operator gave for this recording: {context}\n\n")
     };
 
     let user = format!(
-        "Write notes for this transcript. \"Me\" is the professional; \"Other\" is the client \
-or counterparty. {scope}{background}Record only genuine decisions and concrete commitments, \
-not every statement. Each decision and action item must set \"at_seconds\" to the [Ns] \
-timecode of the line it came from. Use this exact JSON shape:\n{schema}\n\n\
-Transcript:\n{}",
-        format_segments(segments)
+        "Write notes for this transcript. {framing} {scope}{background}Record only genuine \
+decisions and concrete commitments, not every statement. Each decision and action item must \
+set \"at_seconds\" to the [Ns] timecode of the line it came from. Use this exact JSON \
+shape:\n{schema}\n\nTranscript:\n{}",
+        format_segments(segments, scenario)
     );
     gemma_turn(system, &user)
 }
@@ -595,8 +625,22 @@ fn extract_json_object(text: &str) -> Option<&str> {
 
 // --- the JSON protocol shared with scribe-engine ---------------------
 
+/// How to read the transcript — mirrors `scribe-engine`'s
+/// `RecordingScenario`, sent over the wire as a snake_case tag. Defaults
+/// to a virtual meeting if the field is absent.
+#[derive(Deserialize, Clone, Copy, Default)]
+#[serde(rename_all = "snake_case")]
+enum Scenario {
+    SoloMemo,
+    #[default]
+    VirtualMeeting,
+    InPersonMeeting,
+}
+
 #[derive(Deserialize)]
 struct WireTranscript {
+    #[serde(default)]
+    scenario: Scenario,
     #[serde(default)]
     context: Option<String>,
     segments: Vec<WireSegment>,

@@ -10,6 +10,11 @@
 //! end (system audio) on the other, so each channel is transcribed
 //! independently and every segment is attributed by which channel it
 //! came from. See [`crate::audio`].
+//!
+//! Only a [`RecordingScenario::VirtualMeeting`] has a real far end. For
+//! a solo memo or an in-person recording the far channel is silent, so
+//! it is not transcribed — feeding silence to Whisper only invites
+//! hallucinated text.
 
 use std::path::Path;
 use std::time::Duration;
@@ -17,13 +22,15 @@ use std::time::Duration;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 use crate::audio::{self, Channels};
-use crate::model::{Speaker, TranscriptSegment};
+use crate::model::{RecordingScenario, Speaker, TranscriptSegment};
 use crate::{EngineError, Result, Transcript};
 
 /// A transcription backend.
 pub trait Transcriber: Send {
     /// Transcribe a finished recording into a timecoded transcript.
-    fn transcribe(&self, recording: &Path) -> Result<Transcript>;
+    /// `scenario` decides whether the far channel carries a second
+    /// speaker or is silence to be ignored.
+    fn transcribe(&self, recording: &Path, scenario: RecordingScenario) -> Result<Transcript>;
 }
 
 /// The whisper.cpp transcription backend. Load the model once; each
@@ -108,12 +115,17 @@ impl WhisperTranscriber {
 }
 
 impl Transcriber for WhisperTranscriber {
-    fn transcribe(&self, recording: &Path) -> Result<Transcript> {
+    fn transcribe(&self, recording: &Path, scenario: RecordingScenario) -> Result<Transcript> {
         let Channels { near, far } = audio::decode_recording(recording)?;
-        // The two ends are transcribed independently, then interleaved
-        // back into one timeline ordered by start time.
+        // The near end is always the operator's microphone. The far end
+        // is transcribed only for a virtual meeting — for a solo memo or
+        // an in-person recording it is silence, and transcribing silence
+        // only invites hallucinated segments. When both are transcribed
+        // they are interleaved into one timeline ordered by start time.
         let mut segments = self.transcribe_channel(&near, Speaker::Near)?;
-        segments.extend(self.transcribe_channel(&far, Speaker::Far)?);
+        if scenario.captures_system_audio() {
+            segments.extend(self.transcribe_channel(&far, Speaker::Far)?);
+        }
         segments.sort_by_key(|s| s.start);
         Ok(Transcript { segments })
     }

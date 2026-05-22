@@ -25,6 +25,7 @@ whisper.cpp and llama.cpp each statically bundle their own copy of `ggml`. Linke
 
 ## Conventions
 - **Three subsystems, each a trait with pluggable backends:** `capture` → `AudioCapture` (`Recorder`), `transcribe` → `Transcriber` (`WhisperTranscriber`), `notes` → `NotesGenerator` (`SidecarNotesGenerator`). The host app composes them; it never depends on a concrete backend.
+- **`RecordingScenario`** (`model.rs`: `SoloMemo` / `VirtualMeeting` / `InPersonMeeting`) is threaded through all three subsystems: it selects whether `Recorder` captures system audio, whether `transcribe` reads the far channel (silence there only invites Whisper hallucinations), and how the sidecar frames the notes prompt. Only a `VirtualMeeting` (a call held through the computer) is two-channel; the other two are single-microphone.
 - Shared data types live in `model.rs` and are re-exported from `lib.rs`.
 - Every fallible engine call returns `crate::Result<T>` (`EngineError`). No `unwrap`/`expect` in library code.
 - `snake_case` files and modules, one subsystem per file.
@@ -56,6 +57,7 @@ whisper.cpp and llama.cpp each statically bundle their own copy of `ggml`. Linke
 - **B — transcription:** `WhisperTranscriber` (whisper.cpp). Verified end-to-end against a real model + stereo sample.
 - **C — notes:** `SidecarNotesGenerator` + the `scribe-notes-llm` sidecar (llama.cpp). Verified end-to-end producing structured notes from a transcript.
 - **D — capture:** `Recorder` — `cpal` microphone + `screencapturekit` system audio → stereo WAV. Compiles and links; WAV/mix/resample logic unit-tested. Live OS capture needs Screen-Recording + Microphone permissions and a real call — a manual QA step.
+- **`RecordingScenario`** added (2026-05-22): solo memo / virtual meeting / in-person, threaded through capture, transcription, and the sidecar prompt. All `cargo test` green.
 
 Not yet pushed to GitHub.
 

@@ -82,6 +82,11 @@ impl Source {
 /// every few seconds, so memory stays flat no matter how long the
 /// meeting runs; the scratch files are resampled, interleaved into the
 /// stereo WAV, and deleted on stop.
+///
+/// System audio is captured only when `capture_system_audio` is set —
+/// a remote call has a far end, a solo memo or an in-person meeting
+/// does not. When it is unset the recording is microphone-only and the
+/// far channel of the WAV is silence.
 pub struct Recorder {
     out_path: PathBuf,
     /// Raw f32 scratch files, one per channel, written while recording.
@@ -91,6 +96,9 @@ pub struct Recorder {
     far: Samples,
     /// The microphone's true sample rate, learned when its stream opens.
     near_rate: Arc<AtomicU32>,
+    /// Whether to capture the far end (system audio) — true only for a
+    /// remote call. See [`crate::RecordingScenario`].
+    capture_system_audio: bool,
     mic: Option<Source>,
     system: Option<Source>,
     flusher: Option<Source>,
@@ -98,8 +106,10 @@ pub struct Recorder {
 
 impl Recorder {
     /// Create a recorder that will write its stereo WAV to `out_path`
-    /// when [`AudioCapture::stop`] is called.
-    pub fn new(out_path: PathBuf) -> Self {
+    /// when [`AudioCapture::stop`] is called. `capture_system_audio`
+    /// selects whether the far end is recorded — set it for a remote
+    /// call, clear it for a microphone-only memo or in-person meeting.
+    pub fn new(out_path: PathBuf, capture_system_audio: bool) -> Self {
         Self {
             near_raw: out_path.with_extension("near.f32"),
             far_raw: out_path.with_extension("far.f32"),
@@ -107,6 +117,7 @@ impl Recorder {
             near: Samples::default(),
             far: Samples::default(),
             near_rate: Arc::new(AtomicU32::new(SYSTEM_RATE)),
+            capture_system_audio,
             mic: None,
             system: None,
             flusher: None,
@@ -143,18 +154,23 @@ impl AudioCapture for Recorder {
                 return Err(e);
             }
         };
-        // System audio is best-effort: an in-person meeting has none, and
-        // Screen-Recording permission may not be granted yet. If it fails
-        // the recording continues with just the near end.
-        let system = match spawn_source("system audio", {
-            let far = self.far.clone();
-            move |ready, stop| system_audio(far, ready, stop)
-        }) {
-            Ok(source) => Some(source),
-            Err(e) => {
-                eprintln!("scribe: system audio unavailable, recording microphone only — {e}");
-                None
+        // System audio is captured only for a remote call, and even then
+        // best-effort: Screen-Recording permission may not be granted
+        // yet. If it is not wanted, or fails, the recording continues
+        // with just the near end.
+        let system = if self.capture_system_audio {
+            match spawn_source("system audio", {
+                let far = self.far.clone();
+                move |ready, stop| system_audio(far, ready, stop)
+            }) {
+                Ok(source) => Some(source),
+                Err(e) => {
+                    eprintln!("scribe: system audio unavailable, recording microphone only — {e}");
+                    None
+                }
             }
+        } else {
+            None
         };
 
         self.mic = Some(mic);

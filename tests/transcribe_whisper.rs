@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use scribe_engine::{Speaker, Transcriber, WhisperTranscriber};
+use scribe_engine::{RecordingScenario, Speaker, Transcriber, WhisperTranscriber};
 
 fn asset(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -27,7 +27,11 @@ fn transcribes_stereo_recording_with_speaker_attribution() {
     }
 
     let transcriber = WhisperTranscriber::new(&model).expect("load whisper model");
-    let transcript = transcriber.transcribe(&recording).expect("transcribe recording");
+    // A two-channel sample — the virtual-meeting scenario, so both ends
+    // are read.
+    let transcript = transcriber
+        .transcribe(&recording, RecordingScenario::VirtualMeeting)
+        .expect("transcribe recording");
 
     assert!(!transcript.segments.is_empty(), "no segments produced");
 

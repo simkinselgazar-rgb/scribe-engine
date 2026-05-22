@@ -14,6 +14,42 @@ pub enum Speaker {
     Far,
 }
 
+/// What kind of recording a session is — declared by the operator
+/// before recording starts. It decides which audio sources are
+/// captured, how the transcript is attributed, and how the notes model
+/// is told to read the conversation. Channel-based speaker attribution
+/// is only meaningful for a [`VirtualMeeting`](Self::VirtualMeeting),
+/// where the far side plays through the computer; the other two
+/// scenarios are single-microphone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RecordingScenario {
+    /// Just the operator — a dictated memo or note to self. One speaker;
+    /// the microphone is the only source.
+    SoloMemo,
+    /// A virtual meeting held through the computer (Zoom, Teams, Meet).
+    /// The operator is on the microphone and the other party (or
+    /// parties) play through the computer's audio, captured as system
+    /// audio. The two sides land on separate channels and can be
+    /// attributed.
+    #[default]
+    VirtualMeeting,
+    /// People sharing the one microphone — an in-person meeting, or a
+    /// phone call on speaker beside the computer. Everyone is recorded
+    /// acoustically through the microphone and cannot be separated by
+    /// channel.
+    InPersonMeeting,
+}
+
+impl RecordingScenario {
+    /// Whether this scenario captures the far end (system audio). Only a
+    /// virtual meeting has a far end on the computer; a solo memo and an
+    /// in-person recording are microphone-only, so their far channel is
+    /// silent.
+    pub fn captures_system_audio(self) -> bool {
+        matches!(self, Self::VirtualMeeting)
+    }
+}
+
 /// One attributed, timecoded span of transcript.
 #[derive(Debug, Clone)]
 pub struct TranscriptSegment {

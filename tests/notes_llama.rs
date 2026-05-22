@@ -10,7 +10,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use scribe_engine::{
-    NotesGenerator, SidecarNotesGenerator, Speaker, Transcript, TranscriptSegment,
+    NotesGenerator, RecordingScenario, SidecarNotesGenerator, Speaker, Transcript,
+    TranscriptSegment,
 };
 
 fn asset(name: &str) -> PathBuf {
@@ -77,6 +78,7 @@ fn generates_structured_notes_from_a_transcript() {
         .generate(
             &acme_transcript(),
             Some("Kickoff call for the Acme Corp acquisition; focus on the closing timeline."),
+            RecordingScenario::VirtualMeeting,
         )
         .expect("generate notes");
 
