@@ -50,6 +50,9 @@ const OVERLAP_SEGMENTS: usize = 2;
 /// Hard ceiling on operator-supplied context. A backstop; the app
 /// enforces a tighter, model-dependent limit in the UI.
 const MAX_CONTEXT_CHARS: usize = 1_000;
+/// Byte buffer passed to `token_to_piece_bytes` — a UTF-8 BPE token is
+/// at most a handful of bytes; 64 is a conservative upper bound.
+const TOKEN_PIECE_BUF: usize = 64;
 
 /// The notes JSON shape, asked for by both the per-chunk and the
 /// final reduce passes.
@@ -194,7 +197,10 @@ fn dedupe(items: Vec<WireItem>) -> Vec<WireItem> {
     let mut seen = HashSet::new();
     items
         .into_iter()
-        .filter(|item| seen.insert(item.text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()))
+        .filter(|item| {
+            let key = item.text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+            seen.insert(key)
+        })
         .collect()
 }
 
@@ -270,9 +276,10 @@ impl LlamaSession {
             LlamaSampler::dist(seed),
         ]);
         let mut output: Vec<u8> = Vec::new();
-        let mut n_cur = pos;
+        let mut token_pos = pos; // absolute position in the context
+        let mut generated = 0usize;
 
-        for _ in 0..MAX_OUTPUT_TOKENS {
+        while generated < MAX_OUTPUT_TOKENS {
             let token = sampler.sample(&ctx, batch.n_tokens() - 1);
             sampler.accept(token);
             if self.model.is_eog_token(token) {
@@ -280,15 +287,16 @@ impl LlamaSession {
             }
             let bytes = self
                 .model
-                .token_to_piece_bytes(token, 64, false, None)
+                .token_to_piece_bytes(token, TOKEN_PIECE_BUF, false, None)
                 .map_err(|e| format!("could not decode token: {e}"))?;
             output.extend_from_slice(&bytes);
 
             batch.clear();
             batch
-                .add(token, n_cur, &[0], true)
+                .add(token, token_pos, &[0], true)
                 .map_err(|e| format!("could not extend batch: {e}"))?;
-            n_cur += 1;
+            token_pos += 1;
+            generated += 1;
             ctx.decode(&mut batch)
                 .map_err(|e| format!("generation decode failed: {e}"))?;
         }
@@ -376,7 +384,6 @@ fn build_notes_prompt(
 You read a timecoded transcript and return concise, accurate notes. \
 Reply with ONLY a single JSON object and nothing else. No prose, no markdown fences.";
 
-    let schema = NOTES_SCHEMA;
     let framing = scenario_framing(scenario);
 
     let scope = match part {
@@ -397,7 +404,7 @@ part for continuity. "
         "Write notes for this transcript. {framing} {scope}{background}Record only genuine \
 decisions and concrete commitments, not every statement. Each decision and action item must \
 set \"at_seconds\" to the [Ns] timecode of the line it came from. Use this exact JSON \
-shape:\n{schema}\n\nTranscript:\n{}",
+shape:\n{NOTES_SCHEMA}\n\nTranscript:\n{}",
         format_segments(segments, scenario)
     );
     gemma_turn(system, &user)
@@ -409,7 +416,6 @@ fn build_reduce_prompt(parts: &[WireNotes], context: &str) -> String {
     let system = "You combine notes from consecutive parts of one meeting into one final set \
 of notes. Merge duplicate and near-duplicate items. Reply with ONLY a single JSON object and \
 nothing else. No prose, no markdown fences.";
-    let schema = NOTES_SCHEMA;
     let background = if context.is_empty() {
         String::new()
     } else {
@@ -421,7 +427,7 @@ nothing else. No prose, no markdown fences.";
 combined notes for the whole meeting: one summary of three to five sentences, the key \
 decisions, the action items, and a billable-time description. Merge items that repeat across \
 parts, and keep an \"at_seconds\" timecode for each. {background}Use this exact JSON shape:\n\
-{schema}\n\nPart notes:\n{}",
+{NOTES_SCHEMA}\n\nPart notes:\n{}",
         format_part_notes(parts)
     );
     gemma_turn(system, &user)
@@ -466,7 +472,7 @@ fn parse_notes(raw: &str, segments: &[WireSegment]) -> Result<WireNotes, String>
     }
 
     let duration_secs = segments.last().map(|s| s.end_secs).unwrap_or_default();
-    let billable = (!description.is_empty()).then(|| WireBillable {
+    let billable = (!description.is_empty()).then_some(WireBillable {
         duration_secs,
         description,
     });

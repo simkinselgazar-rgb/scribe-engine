@@ -36,6 +36,11 @@ const LEVEL_WINDOW: usize = 4_800;
 /// long meeting never holds the whole recording in memory.
 const FLUSH_INTERVAL: Duration = Duration::from_secs(3);
 
+/// Gain applied to the RMS level so that a typical speech signal reaches
+/// near `1.0` on the capture-panel meters. Speech RMS sits well below
+/// full scale; the multiplier compensates so the meters feel responsive.
+const LEVEL_GAIN: f32 = 4.0;
+
 /// A live capture session. Backends are platform-specific; the host app
 /// holds a `Box<dyn AudioCapture>` and does not know which one it has.
 pub trait AudioCapture: Send {
@@ -116,6 +121,9 @@ impl Recorder {
             out_path,
             near: Samples::default(),
             far: Samples::default(),
+            // Overwritten by the microphone thread once its stream opens.
+            // The fallback value doesn't matter — stop() only reads this
+            // after the mic thread has joined and set the real rate.
             near_rate: Arc::new(AtomicU32::new(SYSTEM_RATE)),
             capture_system_audio,
             mic: None,
@@ -327,7 +335,7 @@ fn rms_level(samples: &Samples) -> f32 {
     }
     let tail = &buf[buf.len() - window..];
     let mean_sq = tail.iter().map(|s| s * s).sum::<f32>() / window as f32;
-    (mean_sq.sqrt() * 4.0).min(1.0)
+    (mean_sq.sqrt() * LEVEL_GAIN).min(1.0)
 }
 
 /// Resample both channels to 16 kHz, interleave them, and write a stereo
