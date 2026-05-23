@@ -1,0 +1,23 @@
+scribe-engine
+Copyright 2026 Ahmed Elgazar
+
+This product is licensed under the Apache License, Version 2.0 (the
+"License"); see the LICENSE file in the project root, or
+https://www.apache.org/licenses/LICENSE-2.0
+
+This product calls into, but does not bundle, the following third-party
+models. Each model is governed by its own license; consult those before
+using this product in a particular deployment:
+
+  - Whisper (OpenAI), via whisper.cpp — MIT License
+    https://github.com/openai/whisper
+
+  - Gemma 4 (Google), via llama.cpp — Gemma Terms of Use (a custom
+    license with use-based restrictions; NOT Apache 2.0)
+    https://ai.google.dev/gemma/terms
+
+The whisper.cpp and llama.cpp inference runtimes are linked at build
+time and are MIT-licensed:
+
+  - whisper.cpp — https://github.com/ggml-org/whisper.cpp
+  - llama.cpp   — https://github.com/ggml-org/llama.cpp

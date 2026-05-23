@@ -482,17 +482,20 @@ fn parse_notes(raw: &str, segments: &[WireSegment]) -> Result<WireNotes, String>
 
 /// Extract and parse the first JSON object from a model response.
 fn parse_json_object(raw: &str) -> Result<serde_json::Value, String> {
-    let json = extract_json_object(raw).ok_or_else(|| {
-        let snippet: String = raw.chars().take(280).collect();
-        format!("model response had no JSON object; got: {snippet:?}")
-    })?;
+    let json = extract_json_object(raw)
+        .ok_or_else(|| "model response had no JSON object".to_string())?;
     // Small models occasionally leave a trailing comma — strict JSON
     // rejects it, so repair that one common slip before parsing.
     let repaired = strip_trailing_commas(json);
-    serde_json::from_str(&repaired).map_err(|e| {
-        let snippet: String = repaired.chars().take(400).collect();
-        format!("model response was not valid JSON: {e}; got: {snippet:?}")
-    })
+    // Note: deliberately not including the raw or repaired model output
+    // in the error string. The output is derived from the transcript
+    // (a confidential conversation) and the parent app may write our
+    // stderr to a system log. serde_json's own error carries
+    // line/column information but not the source bytes — that's the
+    // right level of detail for triage. Reproduce locally with the
+    // same transcript if you need to see the bytes.
+    serde_json::from_str(&repaired)
+        .map_err(|e| format!("model response was not valid JSON: {e}"))
 }
 
 /// Drop trailing commas (`,` before `}` or `]`), the most common way a

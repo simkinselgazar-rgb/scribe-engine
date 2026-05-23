@@ -1,9 +1,6 @@
 # Rust build output
 /target
 
-# A library crate does not commit its lockfile
-Cargo.lock
-
 # OS / editor
 .DS_Store
 .vscode/
