@@ -35,9 +35,13 @@ hound = "3"
 # automatically). Both run entirely on-device.
 cpal = "0.17"
 
-[target.'cfg(target_os = "macos")'.dependencies]
-screencapturekit = "6"
-
 # The transcript ⇄ notes-sidecar wire format, and parsing its output.
+# Needed on every platform that talks to the sidecar; lives above the
+# macOS target-specific block so it is not accidentally captured by it
+# (TOML table-of-arrays scope rules — items below a `[target.X]` header
+# belong to that target).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+screencapturekit = "6"
