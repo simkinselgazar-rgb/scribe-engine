@@ -28,9 +28,11 @@ whisper-rs = "0.14"
 # WAV decoding for recordings, and WAV encoding for the recorder.
 hound = "3"
 
-# Audio capture. Microphone (the near end) via cpal — cross-platform,
-# which also seeds the later Windows tier. System audio (the far end)
-# via Apple's ScreenCaptureKit. Both run entirely on-device.
+# Audio capture. Microphone (the near end) via cpal — cross-platform.
+# System audio (the far end): macOS uses ScreenCaptureKit (below);
+# Windows uses cpal's WASAPI loopback path (opening the default output
+# device with `build_input_stream` sets `AUDCLNT_STREAMFLAGS_LOOPBACK`
+# automatically). Both run entirely on-device.
 cpal = "0.17"
 
 [target.'cfg(target_os = "macos")'.dependencies]

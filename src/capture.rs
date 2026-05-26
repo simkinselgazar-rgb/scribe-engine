@@ -26,7 +26,10 @@ use std::time::Duration;
 use crate::audio::resample_to_whisper;
 use crate::{EngineError, Result};
 
-/// ScreenCaptureKit is configured to deliver system audio at this rate.
+/// Default far-end sample rate. ScreenCaptureKit is configured to
+/// deliver system audio at this rate on macOS; WASAPI loopback on
+/// Windows delivers at whatever the output device's native rate is and
+/// reports the real value via [`Recorder::far_rate`].
 const SYSTEM_RATE: u32 = 48_000;
 
 /// Window, in samples, over which [`Recorder::levels`] averages.
@@ -101,6 +104,11 @@ pub struct Recorder {
     far: Samples,
     /// The microphone's true sample rate, learned when its stream opens.
     near_rate: Arc<AtomicU32>,
+    /// The far end's true sample rate, learned when the system-audio
+    /// stream opens. macOS pins it to [`SYSTEM_RATE`] via SCK; Windows
+    /// reports the WASAPI device's native mix rate (typically 48 kHz,
+    /// sometimes 44.1 kHz).
+    far_rate: Arc<AtomicU32>,
     /// Whether to capture the far end (system audio) — true only for a
     /// remote call. See [`crate::RecordingScenario`].
     capture_system_audio: bool,
@@ -125,6 +133,11 @@ impl Recorder {
             // The fallback value doesn't matter — stop() only reads this
             // after the mic thread has joined and set the real rate.
             near_rate: Arc::new(AtomicU32::new(SYSTEM_RATE)),
+            // Overwritten by the system-audio thread (when present) once
+            // its stream opens. Left at [`SYSTEM_RATE`] when system audio
+            // is not captured — there is no far signal to resample so the
+            // rate is unused.
+            far_rate: Arc::new(AtomicU32::new(SYSTEM_RATE)),
             capture_system_audio,
             mic: None,
             system: None,
@@ -169,7 +182,8 @@ impl AudioCapture for Recorder {
         let system = if self.capture_system_audio {
             match spawn_source("system audio", {
                 let far = self.far.clone();
-                move |ready, stop| system_audio(far, ready, stop)
+                let rate = self.far_rate.clone();
+                move |ready, stop| system_audio(far, rate, ready, stop)
             }) {
                 Ok(source) => Some(source),
                 Err(e) => {
@@ -208,7 +222,7 @@ impl AudioCapture for Recorder {
             &near,
             self.near_rate.load(Ordering::Relaxed),
             &far,
-            SYSTEM_RATE,
+            self.far_rate.load(Ordering::Relaxed),
             &self.out_path,
         );
         let _ = std::fs::remove_file(&self.near_raw);
@@ -460,6 +474,7 @@ fn append_mono<T: Copy>(buf: &Samples, data: &[T], channels: usize, to_f32: impl
 #[cfg(target_os = "macos")]
 fn system_audio(
     far: Samples,
+    far_rate: Arc<AtomicU32>,
     ready: &Sender<std::result::Result<(), String>>,
     stop: Receiver<()>,
 ) {
@@ -494,6 +509,8 @@ fn system_audio(
 
     match open() {
         Ok(stream) => {
+            // SCK is configured for SYSTEM_RATE above — record that.
+            far_rate.store(SYSTEM_RATE, Ordering::Relaxed);
             let _ = ready.send(Ok(()));
             let _ = stop.recv();
             if let Err(e) = stream.stop_capture() {
@@ -556,15 +573,113 @@ fn bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-#[cfg(not(target_os = "macos"))]
+// --- system audio (WASAPI loopback, Windows) -------------------------
+//
+// On Windows, cpal's WASAPI backend reuses the same `build_input_stream`
+// path for output devices: when the device's data-flow is `eRender`,
+// cpal automatically sets `AUDCLNT_STREAMFLAGS_LOOPBACK`, so opening the
+// default *output* device as input gives us the same mix the user is
+// hearing (Zoom remote audio, browser audio, the system mixer). No
+// permission prompt — WASAPI loopback is not gated like macOS Screen
+// Recording, only the microphone needs consent.
+
+#[cfg(target_os = "windows")]
+fn system_audio(
+    far: Samples,
+    far_rate: Arc<AtomicU32>,
+    ready: &Sender<std::result::Result<(), String>>,
+    stop: Receiver<()>,
+) {
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+    let open = || -> std::result::Result<cpal::Stream, String> {
+        let device = cpal::default_host()
+            .default_output_device()
+            .ok_or("no default output device for system-audio loopback")?;
+        // Use the device's preferred *output* config — that is what
+        // WASAPI loopback will deliver to us as input. Querying the
+        // input-side configs on a render endpoint is not meaningful.
+        let supported = device
+            .default_output_config()
+            .map_err(|e| format!("no usable system-audio format: {e}"))?;
+        let channels = supported.channels() as usize;
+        let format = supported.sample_format();
+        far_rate.store(supported.sample_rate().0, Ordering::Relaxed);
+        let config: cpal::StreamConfig = supported.into();
+
+        let on_error = |e| eprintln!("scribe: system-audio stream error: {e}");
+        let stream = match format {
+            cpal::SampleFormat::F32 => {
+                let far = far.clone();
+                device.build_input_stream(
+                    &config,
+                    move |data: &[f32], _: &_| append_mono(&far, data, channels, |s| s),
+                    on_error,
+                    None,
+                )
+            }
+            cpal::SampleFormat::I16 => {
+                let far = far.clone();
+                device.build_input_stream(
+                    &config,
+                    move |data: &[i16], _: &_| {
+                        append_mono(&far, data, channels, |s| s as f32 / 32768.0)
+                    },
+                    on_error,
+                    None,
+                )
+            }
+            cpal::SampleFormat::U16 => {
+                let far = far.clone();
+                device.build_input_stream(
+                    &config,
+                    move |data: &[u16], _: &_| {
+                        // U16 PCM is unsigned with mid-scale 32768.
+                        append_mono(&far, data, channels, |s| {
+                            (s as f32 - 32768.0) / 32768.0
+                        })
+                    },
+                    on_error,
+                    None,
+                )
+            }
+            other => {
+                return Err(format!("unsupported system-audio sample format: {other:?}"))
+            }
+        }
+        .map_err(|e| format!("could not open WASAPI loopback: {e}"))?;
+        stream
+            .play()
+            .map_err(|e| format!("could not start WASAPI loopback: {e}"))?;
+        Ok(stream)
+    };
+
+    match open() {
+        Ok(_stream) => {
+            let _ = ready.send(Ok(()));
+            // Hold the stream alive — cpal delivers samples on its own
+            // thread — until the recorder calls stop. Dropping the
+            // stream value at the end of this scope stops loopback.
+            let _ = stop.recv();
+        }
+        Err(e) => {
+            let _ = ready.send(Err(e));
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn system_audio(
     _far: Samples,
+    _far_rate: Arc<AtomicU32>,
     ready: &Sender<std::result::Result<(), String>>,
     _stop: Receiver<()>,
 ) {
-    // Windows (WASAPI loopback) is a fast-follow — see the diagnosis.
+    // Linux / BSD / other: no first-party system-audio capture path
+    // ships in v0.1. The host app should clear `capture_system_audio`
+    // on these platforms — falling through to here just records mic.
     let _ = ready.send(Err(
-        "system-audio capture is not yet implemented on this platform".into(),
+        "system-audio capture is not supported on this platform".into(),
     ));
 }
 

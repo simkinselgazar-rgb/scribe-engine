@@ -33,9 +33,11 @@ weaken it.
   governed by the Gemma Terms of Use (a custom Google license, *not*
   Apache-2.0); the consuming app is responsible for confirming the
   terms are acceptable for its deployment.
-- **Audio capture:** microphone via `cpal` (cross-platform); macOS
-  system audio via `screencapturekit`. Recordings are stereo WAV —
-  channel 0 near (mic), channel 1 far (system audio).
+- **Audio capture:** microphone via `cpal` (cross-platform); system
+  audio on macOS via `screencapturekit`, on Windows via cpal's WASAPI
+  loopback (opening the default output device with `build_input_stream`
+  automatically sets `AUDCLNT_STREAMFLAGS_LOOPBACK`). Recordings are
+  stereo WAV — channel 0 near (mic), channel 1 far (system audio).
 - **Tests:** `cargo test`
 - **License:** Apache 2.0
 
@@ -120,11 +122,13 @@ production by the consuming desktop app.
 - **Notes:** `SidecarNotesGenerator` + the `scribe-notes-llm` sidecar
   (llama.cpp). Verified end-to-end producing structured notes from a
   transcript.
-- **Capture:** `Recorder` — `cpal` microphone + `screencapturekit`
-  system audio → stereo WAV with disk-streaming for long recordings.
-  Compiles and links; WAV/mix/resample logic unit-tested. Live OS
-  capture requires Screen-Recording + Microphone permissions and is
-  exercised by the consuming app.
+- **Capture:** `Recorder` — `cpal` microphone + system audio
+  (`screencapturekit` on macOS, cpal WASAPI loopback on Windows) →
+  stereo WAV with disk-streaming for long recordings. Compiles and
+  links on both platforms; WAV/mix/resample logic unit-tested. Live OS
+  capture requires the per-platform permissions and is exercised by
+  the consuming app: macOS needs Screen-Recording + Microphone;
+  Windows needs Microphone only (WASAPI loopback is not gated).
 
 ## Known Issues
 
@@ -134,5 +138,7 @@ production by the consuming desktop app.
   sidecar (overlapping ~10-minute chunks, summarize each, one reduce
   pass consolidates). `Recorder` streams audio to disk so memory stays
   flat for any recording length.
-- **Windows system audio (WASAPI loopback) is not implemented** —
-  `system_audio` returns an error off macOS.
+- **Windows system audio (WASAPI loopback) is implemented via cpal**
+  but not yet live-verified on a real Windows machine — `cargo check`
+  passes; the build pipeline + first capture happens on Ahmed's
+  Windows box. `system_audio` still returns an error on Linux/BSD.
