@@ -604,7 +604,7 @@ fn system_audio(
             .map_err(|e| format!("no usable system-audio format: {e}"))?;
         let channels = supported.channels() as usize;
         let format = supported.sample_format();
-        far_rate.store(supported.sample_rate().0, Ordering::Relaxed);
+        far_rate.store(supported.sample_rate(), Ordering::Relaxed);
         let config: cpal::StreamConfig = supported.into();
 
         let on_error = |e| eprintln!("scribe: system-audio stream error: {e}");
