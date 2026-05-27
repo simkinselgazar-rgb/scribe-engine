@@ -72,11 +72,21 @@ impl NotesGenerator for SidecarNotesGenerator {
         let request = serde_json::to_vec(&WireTranscript::new(transcript, context, scenario))
             .map_err(|e| EngineError::Notes(format!("could not encode transcript: {e}")))?;
 
+        // Sidecar stderr is routed to the null device on every platform.
+        // The host app may be a GUI-subsystem binary (Windows: `windows_-
+        // subsystem = "windows"`) with no stderr handle to inherit, in
+        // which case the sidecar's ~68 KB of llama.cpp model-loader log
+        // output blocks writing to a NULL handle and the whole process
+        // deadlocks before generation begins. Routing to null gives the
+        // C runtime a real sink; the writes succeed and are dropped. We
+        // give up debug visibility on macOS too in exchange — the
+        // sidecar's structured errors come back via stdout / exit code,
+        // which is what we actually act on.
         let mut child = Command::new(&self.sidecar)
             .arg(&self.model)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::null())
             .spawn()
             .map_err(|e| {
                 EngineError::Notes(format!(
@@ -85,14 +95,21 @@ impl NotesGenerator for SidecarNotesGenerator {
                 ))
             })?;
 
-        // The transcript is small and the sidecar reads stdin to EOF
-        // before generating, so a single blocking write cannot deadlock.
-        child
-            .stdin
-            .take()
-            .ok_or_else(|| EngineError::Notes("notes sidecar stdin unavailable".into()))?
-            .write_all(&request)
-            .map_err(|e| EngineError::Notes(format!("could not send transcript: {e}")))?;
+        // Send the transcript and close stdin so the sidecar sees EOF.
+        // Explicit `drop` so a future refactor that lifts the binding
+        // out of this scope can't accidentally hold the pipe open and
+        // re-introduce a hang. The sidecar reads stdin to EOF before
+        // generating, so a single blocking write cannot deadlock.
+        {
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| EngineError::Notes("notes sidecar stdin unavailable".into()))?;
+            stdin
+                .write_all(&request)
+                .map_err(|e| EngineError::Notes(format!("could not send transcript: {e}")))?;
+            drop(stdin);
+        }
 
         let output = child
             .wait_with_output()
