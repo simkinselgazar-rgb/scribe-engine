@@ -82,18 +82,33 @@ impl NotesGenerator for SidecarNotesGenerator {
         // give up debug visibility on macOS too in exchange — the
         // sidecar's structured errors come back via stdout / exit code,
         // which is what we actually act on.
-        let mut child = Command::new(&self.sidecar)
-            .arg(&self.model)
+        let mut cmd = Command::new(&self.sidecar);
+        cmd.arg(&self.model)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| {
-                EngineError::Notes(format!(
-                    "could not start notes sidecar {}: {e}",
-                    self.sidecar.display()
-                ))
-            })?;
+            .stderr(Stdio::null());
+
+        // Windows: the sidecar is a console-subsystem binary, so without
+        // CREATE_NO_WINDOW Windows allocates a console window for it
+        // and the user sees a black terminal flash on screen while the
+        // notes generate. On a confidentiality-first product that
+        // promises "nothing leaves your machine," a surprise terminal
+        // window prompts exactly the wrong question. CREATE_NO_WINDOW
+        // (0x08000000) suppresses the console; no behavioural change
+        // since stdin/stdout/stderr are already explicitly redirected
+        // above.
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000);
+        }
+
+        let mut child = cmd.spawn().map_err(|e| {
+            EngineError::Notes(format!(
+                "could not start notes sidecar {}: {e}",
+                self.sidecar.display()
+            ))
+        })?;
 
         // Send the transcript and close stdin so the sidecar sees EOF.
         // Explicit `drop` so a future refactor that lifts the binding
