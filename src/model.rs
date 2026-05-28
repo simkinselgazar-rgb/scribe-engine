@@ -91,5 +91,7 @@ pub struct Notes {
     pub summary: String,
     pub decisions: Vec<NoteItem>,
     pub action_items: Vec<NoteItem>,
+    /// Questions raised but left unresolved, or items explicitly deferred.
+    pub open_questions: Vec<NoteItem>,
     pub billable: Option<BillableDraft>,
 }

@@ -204,6 +204,10 @@ struct WireNotes {
     summary: String,
     decisions: Vec<WireItem>,
     action_items: Vec<WireItem>,
+    // `default` so notes from an older sidecar that predates the field
+    // still deserialize cleanly.
+    #[serde(default)]
+    open_questions: Vec<WireItem>,
     billable: Option<WireBillable>,
 }
 
@@ -229,6 +233,7 @@ impl From<WireNotes> for Notes {
             summary: wire.summary,
             decisions: wire.decisions.into_iter().map(item).collect(),
             action_items: wire.action_items.into_iter().map(item).collect(),
+            open_questions: wire.open_questions.into_iter().map(item).collect(),
             billable: wire.billable.map(|b| BillableDraft {
                 duration: Duration::from_secs(b.duration_secs),
                 description: b.description,

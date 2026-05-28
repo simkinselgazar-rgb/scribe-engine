@@ -60,6 +60,7 @@ const NOTES_SCHEMA: &str = r#"{
   "summary": "two or three sentences describing the meeting",
   "decisions": [{"text": "a decision that was made", "at_seconds": 0}],
   "action_items": [{"text": "a task someone committed to", "at_seconds": 0}],
+  "open_questions": [{"text": "a question raised but left unresolved, or something deferred for later", "at_seconds": 0}],
   "billable_description": "one short line describing the work, for a time entry"
 }"#;
 
@@ -162,6 +163,7 @@ fn generate_chunked(
     // A mechanical backstop for any exact duplicates the model leaves.
     notes.decisions = dedupe(notes.decisions);
     notes.action_items = dedupe(notes.action_items);
+    notes.open_questions = dedupe(notes.open_questions);
     Ok(notes)
 }
 
@@ -402,8 +404,10 @@ part for continuity. "
 
     let user = format!(
         "Write notes for this transcript. {framing} {scope}{background}Record only genuine \
-decisions and concrete commitments, not every statement. Each decision and action item must \
-set \"at_seconds\" to the [Ns] timecode of the line it came from. Use this exact JSON \
+decisions and concrete commitments, not every statement. Capture as open questions anything \
+that was raised but left unresolved, or explicitly deferred; if nothing was left open, return \
+an empty list. Do not invent open questions. Each decision, action item, and open question \
+must set \"at_seconds\" to the [Ns] timecode of the line it came from. Use this exact JSON \
 shape:\n{NOTES_SCHEMA}\n\nTranscript:\n{}",
         format_segments(segments, scenario)
     );
@@ -425,8 +429,9 @@ nothing else. No prose, no markdown fences.";
     let user = format!(
         "Below are notes from consecutive parts of one meeting, in order. Produce the final \
 combined notes for the whole meeting: one summary of three to five sentences, the key \
-decisions, the action items, and a billable-time description. Merge items that repeat across \
-parts, and keep an \"at_seconds\" timecode for each. {background}Use this exact JSON shape:\n\
+decisions, the action items, the open questions, and a billable-time description. Merge items \
+that repeat across parts, and keep an \"at_seconds\" timecode for each. {background}Use this \
+exact JSON shape:\n\
 {NOTES_SCHEMA}\n\nPart notes:\n{}",
         format_part_notes(parts)
     );
@@ -450,6 +455,12 @@ fn format_part_notes(parts: &[WireNotes]) -> String {
                 out.push_str(&format!("- {} [{}s]\n", a.text, a.source_secs.unwrap_or(0)));
             }
         }
+        if !part.open_questions.is_empty() {
+            out.push_str("Open questions:\n");
+            for q in &part.open_questions {
+                out.push_str(&format!("- {} [{}s]\n", q.text, q.source_secs.unwrap_or(0)));
+            }
+        }
         out.push('\n');
     }
     out
@@ -465,6 +476,7 @@ fn parse_notes(raw: &str, segments: &[WireSegment]) -> Result<WireNotes, String>
     let summary = string_field(&value, "summary");
     let decisions = parse_items(value.get("decisions"));
     let action_items = parse_items(value.get("action_items"));
+    let open_questions = parse_items(value.get("open_questions"));
     let description = string_field(&value, "billable_description");
 
     if summary.is_empty() && decisions.is_empty() && action_items.is_empty() {
@@ -477,7 +489,7 @@ fn parse_notes(raw: &str, segments: &[WireSegment]) -> Result<WireNotes, String>
         description,
     });
 
-    Ok(WireNotes { summary, decisions, action_items, billable })
+    Ok(WireNotes { summary, decisions, action_items, open_questions, billable })
 }
 
 /// Extract and parse the first JSON object from a model response.
@@ -668,6 +680,7 @@ struct WireNotes {
     summary: String,
     decisions: Vec<WireItem>,
     action_items: Vec<WireItem>,
+    open_questions: Vec<WireItem>,
     billable: Option<WireBillable>,
 }
 
