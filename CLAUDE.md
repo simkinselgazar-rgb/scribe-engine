@@ -138,7 +138,28 @@ production by the consuming desktop app.
   sidecar (overlapping ~10-minute chunks, summarize each, one reduce
   pass consolidates). `Recorder` streams audio to disk so memory stays
   flat for any recording length.
-- **Windows system audio (WASAPI loopback) is implemented via cpal**
-  but not yet live-verified on a real Windows machine — `cargo check`
-  passes; the build pipeline + first capture happens on Ahmed's
-  Windows box. `system_audio` still returns an error on Linux/BSD.
+- **Windows system audio (WASAPI loopback) is live-verified** on a
+  real Windows machine as of 2026-05-28 (Krono v0.4.8). The cpal-based
+  approach (open the default output device, call `build_input_stream`
+  — cpal auto-sets `AUDCLNT_STREAMFLAGS_LOOPBACK` when the device's
+  data-flow is `eRender`) works end-to-end: a Zoom call captures both
+  sides cleanly. `system_audio` still returns an error on Linux/BSD.
+
+- **Sidecar stderr MUST stay `Stdio::null()` — do not change to
+  `Stdio::inherit()` or `Stdio::piped()` without explicit pipe
+  draining.** The host Krono app is a Windows GUI-subsystem binary
+  (`windows_subsystem = "windows"`) with no stderr handle to inherit;
+  the sidecar's ~68 KB of llama.cpp `llama_model_loader:` /
+  `llama_kv_cache:` log output blocks writing to a NULL handle and the
+  whole process deadlocks during model load before generation can
+  begin. Routing to `Stdio::null()` gives the C runtime a real sink;
+  writes succeed and are dropped. The C runtime in llama.cpp is
+  `fprintf`-based, so this matters; if a future logging refactor
+  switches to a structured logger, re-evaluate.
+
+- **Spawning the sidecar from a Windows GUI app needs
+  `CREATE_NO_WINDOW`** (0x08000000) or Windows allocates a console
+  for the PE32+ console-subsystem child and the user sees a black
+  terminal flash on screen during notes generation. Set on the
+  `std::process::Command` via `CommandExt::creation_flags` under
+  `#[cfg(target_os = "windows")]`.
