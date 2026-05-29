@@ -61,9 +61,22 @@ pub struct TranscriptSegment {
 }
 
 /// A full speaker-attributed, timecoded transcript of one session.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Transcript {
     pub segments: Vec<TranscriptSegment>,
+    /// Whether the far (system-audio) channel actually carried signal.
+    /// `false` only for a virtual meeting whose far channel was silent —
+    /// i.e. system audio was expected but not captured, so the far party
+    /// is missing and the caller should warn rather than present a
+    /// confident one-sided transcript. `true` (no warning) for solo /
+    /// in-person recordings, which have no far end by design.
+    pub system_audio_captured: bool,
+}
+
+impl Default for Transcript {
+    fn default() -> Self {
+        Self { segments: Vec::new(), system_audio_captured: true }
+    }
 }
 
 /// One note line. `source` ties it back to the transcript moment it was

@@ -58,6 +58,7 @@ fn acme_transcript() -> Transcript {
             seg(Far, 1360, "Who on your side is the day-to-day contact?"),
             seg(Near, 1395, "Sarah Okafor, our senior associate, will run the day-to-day."),
         ],
+        system_audio_captured: true,
     }
 }
 

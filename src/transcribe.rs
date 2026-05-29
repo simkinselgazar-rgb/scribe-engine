@@ -33,6 +33,12 @@ pub trait Transcriber: Send {
     fn transcribe(&self, recording: &Path, scenario: RecordingScenario) -> Result<Transcript>;
 }
 
+/// Peak amplitude (normalized f32) the far channel must exceed for
+/// system audio to count as "captured." The failure mode is a digitally
+/// silent far channel (exactly 0.0), so any real signal clears this; the
+/// small floor tolerates dither/noise without counting it as content.
+const FAR_SILENCE_FLOOR: f32 = 0.0005;
+
 /// The whisper.cpp transcription backend. Load the model once; each
 /// [`Transcriber::transcribe`] call spins up its own decoder state, so
 /// one transcriber can be reused across sessions.
@@ -123,11 +129,20 @@ impl Transcriber for WhisperTranscriber {
         // only invites hallucinated segments. When both are transcribed
         // they are interleaved into one timeline ordered by start time.
         let mut segments = self.transcribe_channel(&near, Speaker::Near)?;
-        if scenario.captures_system_audio() {
+        // For a virtual meeting the far channel should carry the other
+        // party's voice. If it is silent, system audio was not captured
+        // (permission, audio routing, or the SCK audio bridge) — the far
+        // party is missing and the caller must be told, not handed a
+        // confident one-sided transcript. Solo / in-person recordings
+        // have no far end, so this is not applicable (treated as captured).
+        let system_audio_captured = if scenario.captures_system_audio() {
             segments.extend(self.transcribe_channel(&far, Speaker::Far)?);
-        }
+            far.iter().any(|s| s.abs() > FAR_SILENCE_FLOOR)
+        } else {
+            true
+        };
         segments.sort_by_key(|s| s.start);
-        Ok(Transcript { segments })
+        Ok(Transcript { segments, system_audio_captured })
     }
 }
 
