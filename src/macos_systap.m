@@ -49,6 +49,7 @@ typedef struct KronoSysTap {
     krono_audio_cb cb;
     void *ctx;
     int channels; // channels in the tap stream, for the IO proc to mix
+    unsigned long long frames_seen; // total frames the IO block delivered
 } KronoSysTap;
 
 static os_log_t krono_log(void) {
@@ -77,38 +78,21 @@ static void krono_diag(NSString *fmt, ...) {
     }
 }
 
-// The IO proc: tapped audio arrives in inInputData as float32. Average
-// channels to mono and hand the frames to Rust.
-static OSStatus krono_io_proc(AudioObjectID device, const AudioTimeStamp *now,
-                              const AudioBufferList *inInputData,
-                              const AudioTimeStamp *inputTime,
-                              AudioBufferList *outOutputData,
-                              const AudioTimeStamp *outputTime, void *clientData) {
-    (void)device; (void)now; (void)inputTime; (void)outOutputData; (void)outputTime;
-    KronoSysTap *t = (KronoSysTap *)clientData;
-    if (!t || !t->cb || !inInputData || inInputData->mNumberBuffers == 0) return noErr;
-
-    // Log the first callback once, so we can confirm the IO proc fires at
-    // all and see the buffer shape it delivers.
-    static dispatch_once_t io_once;
-    dispatch_once(&io_once, ^{
-        const AudioBuffer *b0 = &inInputData->mBuffers[0];
-        krono_diag(@"io proc FIRING: buffers=%u ch0=%u bytes=%u",
-                   (unsigned)inInputData->mNumberBuffers,
-                   (unsigned)b0->mNumberChannels, (unsigned)b0->mDataByteSize);
-    });
-
+// Process one IO buffer of tapped audio: average channels to mono and
+// hand the frames to Rust. No file I/O here (this runs on the realtime
+// audio thread); frame accounting is logged later, at stop.
+static void krono_process_input(KronoSysTap *t, const AudioBufferList *inInputData) {
+    if (!t || !t->cb || !inInputData || inInputData->mNumberBuffers == 0) return;
     const AudioBuffer *buf = &inInputData->mBuffers[0];
     int chans = buf->mNumberChannels > 0 ? (int)buf->mNumberChannels : 1;
     const float *data = (const float *)buf->mData;
-    if (!data) return noErr;
+    if (!data) return;
     int total = (int)(buf->mDataByteSize / sizeof(float));
     int frames = total / chans;
-    if (frames <= 0) return noErr;
+    if (frames <= 0) return;
 
-    // Interleaved float frames -> mono average.
     float *mono = (float *)malloc(sizeof(float) * frames);
-    if (!mono) return noErr;
+    if (!mono) return;
     for (int f = 0; f < frames; f++) {
         float sum = 0.0f;
         for (int c = 0; c < chans; c++) sum += data[f * chans + c];
@@ -116,7 +100,7 @@ static OSStatus krono_io_proc(AudioObjectID device, const AudioTimeStamp *now,
     }
     t->cb(t->ctx, mono, frames);
     free(mono);
-    return noErr;
+    t->frames_seen += (unsigned long long)frames;
 }
 
 static NSString *krono_default_output_uid(void) {
@@ -221,8 +205,21 @@ void *krono_systap_start(krono_audio_cb cb, void *ctx, double *out_sample_rate,
         t->ctx = ctx;
         t->channels = asbd.mChannelsPerFrame > 0 ? (int)asbd.mChannelsPerFrame : 2;
 
-        err = AudioDeviceCreateIOProcID(aggregate, krono_io_proc, t, &t->io_proc);
-        krono_diag(@"AudioDeviceCreateIOProcID err=%d", (int)err);
+        // Use the block + dedicated serial queue variant. For a tap
+        // aggregate device, this is the form that actually drives the IO
+        // callback (the plain AudioDeviceCreateIOProcID set up cleanly but
+        // never fired). Mirrors Apple's AudioCap sample.
+        dispatch_queue_t ioQueue =
+            dispatch_queue_create("com.simkinselgazar.krono.systap.io", DISPATCH_QUEUE_SERIAL);
+        err = AudioDeviceCreateIOProcIDWithBlock(
+            &t->io_proc, aggregate, ioQueue,
+            ^(const AudioTimeStamp *inNow, const AudioBufferList *inInputData,
+              const AudioTimeStamp *inInputTime, AudioBufferList *outOutputData,
+              const AudioTimeStamp *inOutputTime) {
+                (void)inNow; (void)inInputTime; (void)outOutputData; (void)inOutputTime;
+                krono_process_input(t, inInputData);
+            });
+        krono_diag(@"AudioDeviceCreateIOProcIDWithBlock err=%d", (int)err);
         if (err != noErr || !t->io_proc) {
             AudioHardwareDestroyAggregateDevice(aggregate);
             AudioHardwareDestroyProcessTap(tap);
@@ -249,6 +246,7 @@ void *krono_systap_start(krono_audio_cb cb, void *ctx, double *out_sample_rate,
 void krono_systap_stop(void *handle) {
     if (!handle) return;
     KronoSysTap *t = (KronoSysTap *)handle;
+    krono_diag(@"systap stop: IO block delivered %llu frames total", t->frames_seen);
     if (t->io_proc) {
         AudioDeviceStop(t->aggregate, t->io_proc);
         AudioDeviceDestroyIOProcID(t->aggregate, t->io_proc);
