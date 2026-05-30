@@ -58,6 +58,25 @@ static os_log_t krono_log(void) {
     return l;
 }
 
+// Append a diagnostic line to a readable log file. os_log does not
+// surface from the hardened, notarized app via `log show`, so a plain
+// file at a known path is what actually lets us see why the tap behaves
+// the way it does. Best-effort; never throws.
+static void krono_diag(NSString *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    NSString *line = [[NSString alloc] initWithFormat:fmt arguments:args];
+    va_end(args);
+    os_log(krono_log(), "%{public}@", line);
+    NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:
+        @"Library/Application Support/com.simkinselgazar.krono/systap.log"];
+    FILE *f = fopen(path.UTF8String, "a");
+    if (f) {
+        fputs([[line stringByAppendingString:@"\n"] UTF8String], f);
+        fclose(f);
+    }
+}
+
 // The IO proc: tapped audio arrives in inInputData as float32. Average
 // channels to mono and hand the frames to Rust.
 static OSStatus krono_io_proc(AudioObjectID device, const AudioTimeStamp *now,
@@ -68,6 +87,16 @@ static OSStatus krono_io_proc(AudioObjectID device, const AudioTimeStamp *now,
     (void)device; (void)now; (void)inputTime; (void)outOutputData; (void)outputTime;
     KronoSysTap *t = (KronoSysTap *)clientData;
     if (!t || !t->cb || !inInputData || inInputData->mNumberBuffers == 0) return noErr;
+
+    // Log the first callback once, so we can confirm the IO proc fires at
+    // all and see the buffer shape it delivers.
+    static dispatch_once_t io_once;
+    dispatch_once(&io_once, ^{
+        const AudioBuffer *b0 = &inInputData->mBuffers[0];
+        krono_diag(@"io proc FIRING: buffers=%u ch0=%u bytes=%u",
+                   (unsigned)inInputData->mNumberBuffers,
+                   (unsigned)b0->mNumberChannels, (unsigned)b0->mDataByteSize);
+    });
 
     const AudioBuffer *buf = &inInputData->mBuffers[0];
     int chans = buf->mNumberChannels > 0 ? (int)buf->mNumberChannels : 1;
@@ -112,9 +141,10 @@ static NSString *krono_default_output_uid(void) {
 void *krono_systap_start(krono_audio_cb cb, void *ctx, double *out_sample_rate,
                          int *out_channels) {
     @autoreleasepool {
+        krono_diag(@"--- systap start ---");
         Class descClass = NSClassFromString(@"CATapDescription");
         if (!descClass) {
-            os_log_error(krono_log(), "CATapDescription unavailable (needs macOS 14.4+)");
+            krono_diag(@"CATapDescription class not found (needs macOS 14.4+)");
             return NULL;
         }
         // Guard the ObjC setup: if a selector is wrong on this macOS the
@@ -129,23 +159,24 @@ void *krono_systap_start(krono_audio_cb cb, void *ctx, double *out_sample_rate,
             desc.muteBehavior = KronoTapUnmuted; // operator still hears the call
             tapUUID = [desc.UUID UUIDString];
         } @catch (NSException *e) {
-            os_log_error(krono_log(), "CATapDescription setup raised %{public}@: %{public}@",
-                         e.name, e.reason);
+            krono_diag(@"CATapDescription setup raised %@: %@", e.name, e.reason);
             return NULL;
         }
         if (!desc || !tapUUID) {
-            os_log_error(krono_log(), "CATapDescription produced no usable tap UUID");
+            krono_diag(@"CATapDescription produced no usable tap UUID");
             return NULL;
         }
+        krono_diag(@"CATapDescription ok, uuid=%@", tapUUID);
 
         AudioObjectID tap = kAudioObjectUnknown;
         OSStatus err = AudioHardwareCreateProcessTap(desc, &tap);
+        krono_diag(@"AudioHardwareCreateProcessTap err=%d tap=%u", (int)err, (unsigned)tap);
         if (err != noErr || tap == kAudioObjectUnknown) {
-            os_log_error(krono_log(), "AudioHardwareCreateProcessTap failed: %d", (int)err);
             return NULL;
         }
 
         NSString *outUID = krono_default_output_uid();
+        krono_diag(@"default output uid=%@", outUID ?: @"(nil)");
         NSString *aggUID = [[NSUUID UUID] UUIDString];
         NSMutableDictionary *agg = [@{
             @"uid": aggUID,
@@ -162,8 +193,8 @@ void *krono_systap_start(krono_audio_cb cb, void *ctx, double *out_sample_rate,
 
         AudioDeviceID aggregate = kAudioObjectUnknown;
         err = AudioHardwareCreateAggregateDevice((__bridge CFDictionaryRef)agg, &aggregate);
+        krono_diag(@"AudioHardwareCreateAggregateDevice err=%d agg=%u", (int)err, (unsigned)aggregate);
         if (err != noErr || aggregate == kAudioObjectUnknown) {
-            os_log_error(krono_log(), "AudioHardwareCreateAggregateDevice failed: %d", (int)err);
             AudioHardwareDestroyProcessTap(tap);
             return NULL;
         }
@@ -174,9 +205,10 @@ void *krono_systap_start(krono_audio_cb cb, void *ctx, double *out_sample_rate,
         AudioObjectPropertyAddress fmt = {kAudioTapPropertyFormat,
                                           kAudioObjectPropertyScopeGlobal,
                                           kAudioObjectPropertyElementMain};
-        if (AudioObjectGetPropertyData(tap, &fmt, 0, NULL, &size, &asbd) != noErr ||
-            asbd.mSampleRate <= 0) {
-            os_log_error(krono_log(), "reading tap format failed");
+        OSStatus fmtErr = AudioObjectGetPropertyData(tap, &fmt, 0, NULL, &size, &asbd);
+        krono_diag(@"tap format err=%d rate=%.0f ch=%u", (int)fmtErr, asbd.mSampleRate,
+                   (unsigned)asbd.mChannelsPerFrame);
+        if (fmtErr != noErr || asbd.mSampleRate <= 0) {
             AudioHardwareDestroyAggregateDevice(aggregate);
             AudioHardwareDestroyProcessTap(tap);
             return NULL;
@@ -190,16 +222,16 @@ void *krono_systap_start(krono_audio_cb cb, void *ctx, double *out_sample_rate,
         t->channels = asbd.mChannelsPerFrame > 0 ? (int)asbd.mChannelsPerFrame : 2;
 
         err = AudioDeviceCreateIOProcID(aggregate, krono_io_proc, t, &t->io_proc);
+        krono_diag(@"AudioDeviceCreateIOProcID err=%d", (int)err);
         if (err != noErr || !t->io_proc) {
-            os_log_error(krono_log(), "AudioDeviceCreateIOProcID failed: %d", (int)err);
             AudioHardwareDestroyAggregateDevice(aggregate);
             AudioHardwareDestroyProcessTap(tap);
             free(t);
             return NULL;
         }
         err = AudioDeviceStart(aggregate, t->io_proc);
+        krono_diag(@"AudioDeviceStart err=%d", (int)err);
         if (err != noErr) {
-            os_log_error(krono_log(), "AudioDeviceStart failed: %d", (int)err);
             AudioDeviceDestroyIOProcID(aggregate, t->io_proc);
             AudioHardwareDestroyAggregateDevice(aggregate);
             AudioHardwareDestroyProcessTap(tap);
@@ -209,8 +241,7 @@ void *krono_systap_start(krono_audio_cb cb, void *ctx, double *out_sample_rate,
 
         if (out_sample_rate) *out_sample_rate = asbd.mSampleRate;
         if (out_channels) *out_channels = t->channels;
-        os_log(krono_log(), "system-audio tap started: %.0f Hz, %d ch",
-               asbd.mSampleRate, t->channels);
+        krono_diag(@"system-audio tap RUNNING: %.0f Hz, %d ch", asbd.mSampleRate, t->channels);
         return t;
     }
 }
