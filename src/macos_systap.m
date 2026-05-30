@@ -23,6 +23,7 @@
 #import <CoreAudio/AudioHardwareTapping.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <os/log.h>
+#import <dlfcn.h>
 
 // CATapDescription lives in CoreAudio on 14.4+. Declare the bits we use
 // so the file compiles against SDKs whose headers vary; the runtime
@@ -49,7 +50,8 @@ typedef struct KronoSysTap {
     krono_audio_cb cb;
     void *ctx;
     int channels; // channels in the tap stream, for the IO proc to mix
-    unsigned long long frames_seen; // total frames the IO block delivered
+    unsigned long long frames_seen; // total non-empty frames forwarded to Rust
+    unsigned long long io_calls;    // total IO-block invocations (incl. empty)
 } KronoSysTap;
 
 static os_log_t krono_log(void) {
@@ -76,6 +78,59 @@ static void krono_diag(NSString *fmt, ...) {
         fputs([[line stringByAppendingString:@"\n"] UTF8String], f);
         fclose(f);
     }
+}
+
+// Ensure the app holds the "audio recording" consent
+// (kTCCServiceAudioCapture). THIS IS THE LOAD-BEARING STEP for system
+// audio: a Core Audio process tap is created successfully and its IO
+// proc is installed even with NO consent, but it then delivers only
+// EMPTY buffers — exactly the "err=0 everywhere, 0 frames" symptom we
+// saw. Unlike the microphone, there is no public API to request this
+// permission; the only thing that works (per insidegui/AudioCap) is the
+// private TCC framework. We dlopen it, preflight, and request — which
+// shows the system prompt the first time. Returns 1 if authorized (or
+// if we can't tell and should let the tap try), 0 if explicitly denied.
+static int krono_ensure_audio_capture_permission(void) {
+    void *tcc = dlopen("/System/Library/PrivateFrameworks/TCC.framework/TCC", RTLD_NOW);
+    if (!tcc) {
+        krono_diag(@"TCC.framework dlopen failed (%s) — proceeding blind", dlerror());
+        return 1; // fail open: let the tap attempt proceed
+    }
+    typedef int (*PreflightFn)(CFStringRef, CFDictionaryRef);
+    typedef void (*RequestFn)(CFStringRef, CFDictionaryRef, void (^)(BOOL));
+    PreflightFn preflight = (PreflightFn)dlsym(tcc, "TCCAccessPreflight");
+    RequestFn request = (RequestFn)dlsym(tcc, "TCCAccessRequest");
+    CFStringRef service = CFSTR("kTCCServiceAudioCapture");
+
+    if (preflight) {
+        // Observed values: 0 = authorized, 1 = denied, 2 = undetermined.
+        int status = preflight(service, NULL);
+        krono_diag(@"TCC audio-capture preflight=%d (0=auth 1=denied 2=undetermined)", status);
+        if (status == 0) return 1; // already granted — no prompt needed
+    }
+    if (!request) {
+        krono_diag(@"TCCAccessRequest symbol missing — proceeding blind");
+        return 1; // fail open
+    }
+    // Undetermined (first run) → this shows the prompt. Already-denied →
+    // TCC returns the cached denial without re-prompting. We run on the
+    // Rust capture thread (never the main thread), so blocking on the
+    // semaphore while the system presents the prompt is safe.
+    __block int granted = -1;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    krono_diag(@"requesting audio-capture consent (system prompt if undetermined)...");
+    request(service, NULL, ^(BOOL g) {
+        granted = g ? 1 : 0;
+        dispatch_semaphore_signal(sem);
+    });
+    long timedOut = dispatch_semaphore_wait(
+        sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)120 * NSEC_PER_SEC));
+    if (timedOut != 0) {
+        krono_diag(@"audio-capture consent: no response in 120s — treating as denied");
+        return 0;
+    }
+    krono_diag(@"audio-capture consent granted=%d", granted);
+    return granted == 1 ? 1 : 0;
 }
 
 // Process one IO buffer of tapped audio: average channels to mono and
@@ -126,6 +181,13 @@ void *krono_systap_start(krono_audio_cb cb, void *ctx, double *out_sample_rate,
                          int *out_channels) {
     @autoreleasepool {
         krono_diag(@"--- systap start ---");
+        // Consent first: without kTCCServiceAudioCapture the tap below
+        // succeeds but delivers only empty buffers. Fail to mic-only
+        // (NULL) + the system-audio warning if the user declines.
+        if (!krono_ensure_audio_capture_permission()) {
+            krono_diag(@"audio-capture permission denied — falling back to mic-only");
+            return NULL;
+        }
         Class descClass = NSClassFromString(@"CATapDescription");
         if (!descClass) {
             krono_diag(@"CATapDescription class not found (needs macOS 14.4+)");
@@ -217,6 +279,8 @@ void *krono_systap_start(krono_audio_cb cb, void *ctx, double *out_sample_rate,
               const AudioTimeStamp *inInputTime, AudioBufferList *outOutputData,
               const AudioTimeStamp *inOutputTime) {
                 (void)inNow; (void)inInputTime; (void)outOutputData; (void)inOutputTime;
+                t->io_calls++; // count every fire, even empty, to tell
+                               // "never fired" from "fired but silent"
                 krono_process_input(t, inInputData);
             });
         krono_diag(@"AudioDeviceCreateIOProcIDWithBlock err=%d", (int)err);
@@ -246,7 +310,8 @@ void *krono_systap_start(krono_audio_cb cb, void *ctx, double *out_sample_rate,
 void krono_systap_stop(void *handle) {
     if (!handle) return;
     KronoSysTap *t = (KronoSysTap *)handle;
-    krono_diag(@"systap stop: IO block delivered %llu frames total", t->frames_seen);
+    krono_diag(@"systap stop: IO block fired %llu times, delivered %llu non-empty frames total",
+               t->io_calls, t->frames_seen);
     if (t->io_proc) {
         AudioDeviceStop(t->aggregate, t->io_proc);
         AudioDeviceDestroyIOProcID(t->aggregate, t->io_proc);
