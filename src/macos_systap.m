@@ -29,13 +29,14 @@
 // class is resolved by the ObjC runtime.
 typedef NS_ENUM(NSInteger, KronoTapMute) { KronoTapUnmuted = 0 };
 
+// Only the members we actually use. Setting properties that don't exist
+// on the real class throws an unrecognized-selector exception, so we
+// keep this to the documented essentials (init + UUID + muteBehavior)
+// and guard the call site with @try/@catch.
 @interface CATapDescription : NSObject
 - (instancetype)initStereoGlobalTapButExcludeProcesses:(NSArray *)processes;
 @property (nonatomic, copy) NSUUID *UUID;
 @property (nonatomic, assign) NSInteger muteBehavior;
-@property (nonatomic, getter=isPrivate) BOOL privateTap;
-@property (nonatomic, getter=isExclusive) BOOL exclusive;
-@property (nonatomic, copy) NSString *name;
 @end
 
 // Rust-side callback: receives interleaved-then-averaged mono f32 frames.
@@ -116,12 +117,26 @@ void *krono_systap_start(krono_audio_cb cb, void *ctx, double *out_sample_rate,
             os_log_error(krono_log(), "CATapDescription unavailable (needs macOS 14.4+)");
             return NULL;
         }
-        CATapDescription *desc =
-            [[descClass alloc] initStereoGlobalTapButExcludeProcesses:@[]];
-        desc.name = @"Krono system audio";
-        desc.UUID = [NSUUID UUID];
-        desc.muteBehavior = KronoTapUnmuted; // operator still hears the call
-        desc.privateTap = YES;
+        // Guard the ObjC setup: if a selector is wrong on this macOS the
+        // runtime raises an exception, and an uncaught ObjC exception
+        // aborts the whole app. Catch it and fall back to mic-only
+        // (NULL) + the system-audio warning instead of crashing.
+        CATapDescription *desc = nil;
+        NSString *tapUUID = nil;
+        @try {
+            desc = [[descClass alloc] initStereoGlobalTapButExcludeProcesses:@[]];
+            desc.UUID = [NSUUID UUID];
+            desc.muteBehavior = KronoTapUnmuted; // operator still hears the call
+            tapUUID = [desc.UUID UUIDString];
+        } @catch (NSException *e) {
+            os_log_error(krono_log(), "CATapDescription setup raised %{public}@: %{public}@",
+                         e.name, e.reason);
+            return NULL;
+        }
+        if (!desc || !tapUUID) {
+            os_log_error(krono_log(), "CATapDescription produced no usable tap UUID");
+            return NULL;
+        }
 
         AudioObjectID tap = kAudioObjectUnknown;
         OSStatus err = AudioHardwareCreateProcessTap(desc, &tap);
@@ -138,7 +153,7 @@ void *krono_systap_start(krono_audio_cb cb, void *ctx, double *out_sample_rate,
             @"private": @YES,
             @"stacked": @NO,
             @"tapautostart": @YES,
-            @"taplist": @[ @{ @"uid": [desc.UUID UUIDString], @"drift": @YES } ],
+            @"taplist": @[ @{ @"uid": tapUUID, @"drift": @YES } ],
         } mutableCopy];
         if (outUID) {
             agg[@"master"] = outUID;
