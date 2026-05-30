@@ -491,15 +491,26 @@ fn system_audio(
             .with_display(&display)
             .with_excluding_windows(&[])
             .build();
-        // Video is captured but never handled — keep its frames tiny.
+        // Video frames are captured but discarded — keep them tiny.
         let config = SCStreamConfiguration::new()
             .with_width(16)
             .with_height(16)
             .with_captures_audio(true)
+            // Don't record Krono's own audio back into the far channel.
+            .with_excludes_current_process_audio(true)
             .with_sample_rate(SYSTEM_RATE as i32)
             .with_channel_count(2);
 
         let mut stream = SCStream::new(&filter, &config);
+        // A screen output handler MUST be attached even though we only
+        // want audio. On macOS 15/26 ScreenCaptureKit does not deliver
+        // any audio sample buffers unless the stream is also pumping
+        // screen frames (a known regression — the `.audio` callback never
+        // fires for an audio-only stream). The crate's own audio example
+        // registers a Screen handler for the same reason. We drain the
+        // (16x16) frames into a no-op sink; only the audio handler does
+        // real work.
+        stream.add_output_handler(NoopScreenHandler, SCStreamOutputType::Screen);
         stream.add_output_handler(SystemAudioHandler { far: far.clone() }, SCStreamOutputType::Audio);
         stream
             .start_capture()
@@ -561,6 +572,23 @@ impl screencapturekit::prelude::SCStreamOutputTrait for SystemAudioHandler {
                 far.push(sum / channels.len() as f32);
             }
         }
+    }
+}
+
+/// A do-nothing screen-output handler. Its only job is to exist: a
+/// ScreenCaptureKit stream on macOS 15/26 won't deliver audio sample
+/// buffers unless a screen output is also attached and pumping. We drop
+/// every frame.
+#[cfg(target_os = "macos")]
+struct NoopScreenHandler;
+
+#[cfg(target_os = "macos")]
+impl screencapturekit::prelude::SCStreamOutputTrait for NoopScreenHandler {
+    fn did_output_sample_buffer(
+        &self,
+        _sample: screencapturekit::prelude::CMSampleBuffer,
+        _of_type: screencapturekit::prelude::SCStreamOutputType,
+    ) {
     }
 }
 
