@@ -469,7 +469,49 @@ fn append_mono<T: Copy>(buf: &Samples, data: &[T], channels: usize, to_f32: impl
     }
 }
 
-// --- system audio (ScreenCaptureKit, macOS) --------------------------
+// --- system audio (Core Audio process tap, macOS 14.6+) --------------
+//
+// The far (system-audio) channel is captured with a Core Audio process
+// tap implemented in `src/macos_systap.m`. The tap uses the narrow
+// audio-recording permission instead of Screen Recording, and avoids the
+// macOS 15/26 ScreenCaptureKit audio-callback regression. The shim owns
+// the CATapDescription / aggregate-device / IO-proc machinery; here we
+// start it, route its mono frames to the far channel, and stop it. The
+// host app gates on macOS 14.6 before requesting this; below that the
+// far channel stays silent and the app warns + records mic-only.
+
+#[cfg(target_os = "macos")]
+mod systap_ffi {
+    use std::os::raw::{c_int, c_void};
+    extern "C" {
+        pub fn krono_systap_start(
+            cb: extern "C" fn(*mut c_void, *const f32, c_int),
+            ctx: *mut c_void,
+            out_sample_rate: *mut f64,
+            out_channels: *mut c_int,
+        ) -> *mut c_void;
+        pub fn krono_systap_stop(handle: *mut c_void);
+    }
+}
+
+/// Called from the tap's realtime IO thread with mono `f32` frames.
+/// `ctx` points at the far channel's `Mutex<Vec<f32>>`, kept alive by the
+/// capture thread for the tap's whole lifetime.
+#[cfg(target_os = "macos")]
+extern "C" fn systap_callback(
+    ctx: *mut std::os::raw::c_void,
+    samples: *const f32,
+    count: std::os::raw::c_int,
+) {
+    if ctx.is_null() || samples.is_null() || count <= 0 {
+        return;
+    }
+    let far = unsafe { &*(ctx as *const Mutex<Vec<f32>>) };
+    let slice = unsafe { std::slice::from_raw_parts(samples, count as usize) };
+    if let Ok(mut buf) = far.lock() {
+        buf.extend_from_slice(slice);
+    }
+}
 
 #[cfg(target_os = "macos")]
 fn system_audio(
@@ -478,127 +520,32 @@ fn system_audio(
     ready: &Sender<std::result::Result<(), String>>,
     stop: Receiver<()>,
 ) {
-    use screencapturekit::prelude::*;
-
-    let open = || -> std::result::Result<SCStream, String> {
-        let content = SCShareableContent::get().map_err(|e| format!("{e}"))?;
-        let display = content
-            .displays()
-            .into_iter()
-            .next()
-            .ok_or("no display available for audio capture")?;
-        let filter = SCContentFilter::create()
-            .with_display(&display)
-            .with_excluding_windows(&[])
-            .build();
-        // Video frames are captured but discarded — keep them tiny.
-        let config = SCStreamConfiguration::new()
-            .with_width(16)
-            .with_height(16)
-            .with_captures_audio(true)
-            // Don't record Krono's own audio back into the far channel.
-            .with_excludes_current_process_audio(true)
-            .with_sample_rate(SYSTEM_RATE as i32)
-            .with_channel_count(2);
-
-        let mut stream = SCStream::new(&filter, &config);
-        // A screen output handler MUST be attached even though we only
-        // want audio. On macOS 15/26 ScreenCaptureKit does not deliver
-        // any audio sample buffers unless the stream is also pumping
-        // screen frames (a known regression — the `.audio` callback never
-        // fires for an audio-only stream). The crate's own audio example
-        // registers a Screen handler for the same reason. We drain the
-        // (16x16) frames into a no-op sink; only the audio handler does
-        // real work.
-        stream.add_output_handler(NoopScreenHandler, SCStreamOutputType::Screen);
-        stream.add_output_handler(SystemAudioHandler { far: far.clone() }, SCStreamOutputType::Audio);
-        stream
-            .start_capture()
-            .map_err(|e| format!("could not start system-audio capture: {e}"))?;
-        Ok(stream)
+    use std::os::raw::{c_int, c_void};
+    // Pointer to the inner `Mutex<Vec<f32>>`. `far` (the Arc) is held by
+    // this thread until after the tap is stopped, so the pointer is valid
+    // for every IO-proc callback.
+    let ctx = Arc::as_ptr(&far) as *mut c_void;
+    let mut rate: f64 = 0.0;
+    let mut channels: c_int = 0;
+    let handle = unsafe {
+        systap_ffi::krono_systap_start(systap_callback, ctx, &mut rate, &mut channels)
     };
-
-    match open() {
-        Ok(stream) => {
-            // SCK is configured for SYSTEM_RATE above — record that.
-            far_rate.store(SYSTEM_RATE, Ordering::Relaxed);
-            let _ = ready.send(Ok(()));
-            let _ = stop.recv();
-            if let Err(e) = stream.stop_capture() {
-                eprintln!("scribe: system-audio stop failed: {e}");
-            }
-        }
-        Err(e) => {
-            let _ = ready.send(Err(e));
-        }
+    if handle.is_null() {
+        let _ = ready.send(Err(
+            "system-audio tap unavailable (needs macOS 14.6+ and audio-recording permission)"
+                .into(),
+        ));
+        return;
     }
-}
-
-/// ScreenCaptureKit output handler — averages each system-audio sample
-/// buffer to mono and appends it to the far channel.
-#[cfg(target_os = "macos")]
-struct SystemAudioHandler {
-    far: Samples,
-}
-
-#[cfg(target_os = "macos")]
-impl screencapturekit::prelude::SCStreamOutputTrait for SystemAudioHandler {
-    fn did_output_sample_buffer(
-        &self,
-        sample: screencapturekit::prelude::CMSampleBuffer,
-        of_type: screencapturekit::prelude::SCStreamOutputType,
-    ) {
-        use screencapturekit::prelude::{CMSampleBufferExt, SCStreamOutputType};
-        if !matches!(of_type, SCStreamOutputType::Audio) {
-            return;
-        }
-        let Some(list) = sample.audio_buffer_list() else {
-            return;
-        };
-        // ScreenCaptureKit delivers non-interleaved float audio: one
-        // buffer per channel. Average the channels into mono.
-        let channels: Vec<Vec<f32>> = (0..list.num_buffers())
-            .filter_map(|i| list.buffer(i))
-            .map(|b| bytes_to_f32(b.data()))
-            .filter(|c| !c.is_empty())
-            .collect();
-        if channels.is_empty() {
-            return;
-        }
-        let frames = channels.iter().map(Vec::len).min().unwrap_or(0);
-        if let Ok(mut far) = self.far.lock() {
-            for f in 0..frames {
-                let sum: f32 = channels.iter().map(|c| c[f]).sum();
-                far.push(sum / channels.len() as f32);
-            }
-        }
+    if rate > 0.0 {
+        far_rate.store(rate as u32, Ordering::Relaxed);
     }
-}
-
-/// A do-nothing screen-output handler. Its only job is to exist: a
-/// ScreenCaptureKit stream on macOS 15/26 won't deliver audio sample
-/// buffers unless a screen output is also attached and pumping. We drop
-/// every frame.
-#[cfg(target_os = "macos")]
-struct NoopScreenHandler;
-
-#[cfg(target_os = "macos")]
-impl screencapturekit::prelude::SCStreamOutputTrait for NoopScreenHandler {
-    fn did_output_sample_buffer(
-        &self,
-        _sample: screencapturekit::prelude::CMSampleBuffer,
-        _of_type: screencapturekit::prelude::SCStreamOutputType,
-    ) {
-    }
-}
-
-/// Reinterpret a little-endian `f32` PCM byte slice as samples.
-#[cfg(target_os = "macos")]
-fn bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
+    let _ = ready.send(Ok(()));
+    let _ = stop.recv();
+    unsafe { systap_ffi::krono_systap_stop(handle) };
+    // Keep `far` alive until the tap is fully stopped, so `ctx` was valid
+    // for the lifetime of every IO callback.
+    drop(far);
 }
 
 // --- system audio (WASAPI loopback, Windows) -------------------------

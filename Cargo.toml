@@ -43,11 +43,13 @@ cpal = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-[target.'cfg(target_os = "macos")'.dependencies]
-# The `macos_13_0` feature is REQUIRED for system-audio capture: it
-# builds the Swift-bridge audio symbols. Without it, `with_captures_audio`
-# + the `SCStreamOutputType::Audio` handler compile fine but the bridge
-# never delivers any audio, so the far (system-audio) channel is silent.
-# Features are cumulative and gate the MINIMUM macOS; macos_13_0 keeps our
-# macOS 13+ floor while enabling audio. Do not drop this feature.
-screencapturekit = { version = "6", features = ["macos_13_0"] }
+# macOS system audio is captured via a Core Audio process tap
+# (src/macos_systap.m), NOT ScreenCaptureKit — the tap uses the narrow
+# "audio recording" permission instead of Screen Recording, and sidesteps
+# the macOS 15/26 SCK audio-callback regression. Requires macOS 14.6+;
+# the host app gates on the OS version and falls back to mic-only below it.
+
+[build-dependencies]
+# Compiles the Objective-C Core Audio tap shim on macOS (cfg-guarded in
+# build.rs); harmless no-op on other platforms.
+cc = "1"
