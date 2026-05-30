@@ -52,6 +52,14 @@ typedef struct KronoSysTap {
     int channels; // channels in the tap stream, for the IO proc to mix
     unsigned long long frames_seen; // total non-empty frames forwarded to Rust
     unsigned long long io_calls;    // total IO-block invocations (incl. empty)
+    // First-callback buffer shape, captured once on the realtime thread
+    // (no file I/O there) and logged at stop. Distinguishes "tap never
+    // attached as an input stream" (nbuf=0) from "tap attached but the
+    // buffers are empty" (nbuf>0, bytes=0) from "data is present".
+    int shape_captured;
+    unsigned int shape_nbuf;
+    unsigned int shape_b0_bytes, shape_b0_ch;
+    unsigned int shape_b1_bytes, shape_b1_ch;
 } KronoSysTap;
 
 static os_log_t krono_log(void) {
@@ -198,21 +206,17 @@ void *krono_systap_start(krono_audio_cb cb, void *ctx, double *out_sample_rate,
         // aborts the whole app. Catch it and fall back to mic-only
         // (NULL) + the system-audio warning instead of crashing.
         CATapDescription *desc = nil;
-        NSString *tapUUID = nil;
         @try {
             desc = [[descClass alloc] initStereoGlobalTapButExcludeProcesses:@[]];
-            desc.UUID = [NSUUID UUID];
             desc.muteBehavior = KronoTapUnmuted; // operator still hears the call
-            tapUUID = [desc.UUID UUIDString];
         } @catch (NSException *e) {
             krono_diag(@"CATapDescription setup raised %@: %@", e.name, e.reason);
             return NULL;
         }
-        if (!desc || !tapUUID) {
-            krono_diag(@"CATapDescription produced no usable tap UUID");
+        if (!desc) {
+            krono_diag(@"CATapDescription alloc/init failed");
             return NULL;
         }
-        krono_diag(@"CATapDescription ok, uuid=%@", tapUUID);
 
         AudioObjectID tap = kAudioObjectUnknown;
         OSStatus err = AudioHardwareCreateProcessTap(desc, &tap);
@@ -221,6 +225,28 @@ void *krono_systap_start(krono_audio_cb cb, void *ctx, double *out_sample_rate,
             return NULL;
         }
 
+        // Read the tap UUID *after* the create call. The system assigns /
+        // finalizes the description's UUID during AudioHardwareCreateProcessTap;
+        // capturing it beforehand can yield a stale id, which the aggregate
+        // accepts silently (create returns err=0) but AudioDeviceStart then
+        // rejects with 'nope' because no real tap stream is bound. Reading
+        // it here is what sudara's working recipe does.
+        NSString *tapUUID = [[desc UUID] UUIDString];
+        if (!tapUUID) {
+            krono_diag(@"tap has no UUID after create — cannot bind to aggregate");
+            AudioHardwareDestroyProcessTap(tap);
+            return NULL;
+        }
+        krono_diag(@"tap created + bound, uuid=%@", tapUUID);
+
+        // Output-sub-device aggregate — AudioCap's proven topology, and
+        // the only one that STARTS on macOS 15/26. The real output device
+        // provides the IO clock; a tap-only aggregate returns 'nope' from
+        // AudioDeviceStart here because it has no device to clock. The tap
+        // surfaces as the aggregate's input stream ONLY because its taplist
+        // entry now references the UUID read AFTER AudioHardwareCreateProcessTap
+        // (a stale, pre-create UUID made the create silently succeed but left
+        // the tap unbound, which is what produced the earlier nbuf=0).
         NSString *outUID = krono_default_output_uid();
         krono_diag(@"default output uid=%@", outUID ?: @"(nil)");
         NSString *aggUID = [[NSUUID UUID] UUIDString];
@@ -281,6 +307,20 @@ void *krono_systap_start(krono_audio_cb cb, void *ctx, double *out_sample_rate,
                 (void)inNow; (void)inInputTime; (void)outOutputData; (void)inOutputTime;
                 t->io_calls++; // count every fire, even empty, to tell
                                // "never fired" from "fired but silent"
+                if (!t->shape_captured) {
+                    t->shape_captured = 1;
+                    if (inInputData) {
+                        t->shape_nbuf = inInputData->mNumberBuffers;
+                        if (inInputData->mNumberBuffers > 0) {
+                            t->shape_b0_bytes = inInputData->mBuffers[0].mDataByteSize;
+                            t->shape_b0_ch = inInputData->mBuffers[0].mNumberChannels;
+                        }
+                        if (inInputData->mNumberBuffers > 1) {
+                            t->shape_b1_bytes = inInputData->mBuffers[1].mDataByteSize;
+                            t->shape_b1_ch = inInputData->mBuffers[1].mNumberChannels;
+                        }
+                    }
+                }
                 krono_process_input(t, inInputData);
             });
         krono_diag(@"AudioDeviceCreateIOProcIDWithBlock err=%d", (int)err);
@@ -312,6 +352,9 @@ void krono_systap_stop(void *handle) {
     KronoSysTap *t = (KronoSysTap *)handle;
     krono_diag(@"systap stop: IO block fired %llu times, delivered %llu non-empty frames total",
                t->io_calls, t->frames_seen);
+    krono_diag(@"first IO buffer shape: nbuf=%u b0(bytes=%u ch=%u) b1(bytes=%u ch=%u)",
+               t->shape_nbuf, t->shape_b0_bytes, t->shape_b0_ch,
+               t->shape_b1_bytes, t->shape_b1_ch);
     if (t->io_proc) {
         AudioDeviceStop(t->aggregate, t->io_proc);
         AudioDeviceDestroyIOProcID(t->aggregate, t->io_proc);

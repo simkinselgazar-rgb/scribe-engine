@@ -469,36 +469,37 @@ fn append_mono<T: Copy>(buf: &Samples, data: &[T], channels: usize, to_f32: impl
     }
 }
 
-// --- system audio (Core Audio process tap, macOS 14.6+) --------------
+// --- system audio (ScreenCaptureKit, macOS 13+) ----------------------
 //
-// The far (system-audio) channel is captured with a Core Audio process
-// tap implemented in `src/macos_systap.m`. The tap uses the narrow
-// audio-recording permission instead of Screen Recording, and avoids the
-// macOS 15/26 ScreenCaptureKit audio-callback regression. The shim owns
-// the CATapDescription / aggregate-device / IO-proc machinery; here we
-// start it, route its mono frames to the far channel, and stop it. The
-// host app gates on macOS 14.6 before requesting this; below that the
-// far channel stays silent and the app warns + records mic-only.
+// The far (system-audio) channel is captured with ScreenCaptureKit audio,
+// implemented in `src/macos_sckaudio.m`. SCK is the reliable path on
+// macOS 15/26 — the Core Audio process-tap approach (kept in
+// `macos_systap.m` for reference) cannot capture a global mix there. We
+// do NOT record the screen: the SCK stream uses a minimal 2x2 video that
+// is never read; only the audio output is consumed. It requires the
+// Screen Recording ("Screen & System Audio Recording") permission, which
+// SCK prompts for on first start. The shim owns the SCStream machinery;
+// here we start it, route its mono frames to the far channel, and stop it.
 
 #[cfg(target_os = "macos")]
-mod systap_ffi {
+mod sck_ffi {
     use std::os::raw::{c_int, c_void};
     extern "C" {
-        pub fn krono_systap_start(
+        pub fn krono_sckaudio_start(
             cb: extern "C" fn(*mut c_void, *const f32, c_int),
             ctx: *mut c_void,
             out_sample_rate: *mut f64,
             out_channels: *mut c_int,
         ) -> *mut c_void;
-        pub fn krono_systap_stop(handle: *mut c_void);
+        pub fn krono_sckaudio_stop(handle: *mut c_void);
     }
 }
 
-/// Called from the tap's realtime IO thread with mono `f32` frames.
-/// `ctx` points at the far channel's `Mutex<Vec<f32>>`, kept alive by the
-/// capture thread for the tap's whole lifetime.
+/// Called from the SCK audio queue with channel-averaged mono `f32`
+/// frames. `ctx` points at the far channel's `Mutex<Vec<f32>>`, kept
+/// alive by the capture thread for the stream's whole lifetime.
 #[cfg(target_os = "macos")]
-extern "C" fn systap_callback(
+extern "C" fn sckaudio_callback(
     ctx: *mut std::os::raw::c_void,
     samples: *const f32,
     count: std::os::raw::c_int,
@@ -522,18 +523,17 @@ fn system_audio(
 ) {
     use std::os::raw::{c_int, c_void};
     // Pointer to the inner `Mutex<Vec<f32>>`. `far` (the Arc) is held by
-    // this thread until after the tap is stopped, so the pointer is valid
-    // for every IO-proc callback.
+    // this thread until after the stream is stopped, so the pointer is
+    // valid for every audio callback.
     let ctx = Arc::as_ptr(&far) as *mut c_void;
     let mut rate: f64 = 0.0;
     let mut channels: c_int = 0;
     let handle = unsafe {
-        systap_ffi::krono_systap_start(systap_callback, ctx, &mut rate, &mut channels)
+        sck_ffi::krono_sckaudio_start(sckaudio_callback, ctx, &mut rate, &mut channels)
     };
     if handle.is_null() {
         let _ = ready.send(Err(
-            "system-audio tap unavailable (needs macOS 14.6+ and audio-recording permission)"
-                .into(),
+            "system-audio capture unavailable (needs Screen Recording permission)".into(),
         ));
         return;
     }
@@ -542,9 +542,9 @@ fn system_audio(
     }
     let _ = ready.send(Ok(()));
     let _ = stop.recv();
-    unsafe { systap_ffi::krono_systap_stop(handle) };
-    // Keep `far` alive until the tap is fully stopped, so `ctx` was valid
-    // for the lifetime of every IO callback.
+    unsafe { sck_ffi::krono_sckaudio_stop(handle) };
+    // Keep `far` alive until the stream is fully stopped, so `ctx` was
+    // valid for the lifetime of every audio callback.
     drop(far);
 }
 
